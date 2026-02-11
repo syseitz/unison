@@ -153,35 +153,44 @@ let finish () =
 
 let magic = "Unison fingerprint cache format 3"
 
+(* Reference to lowmemory pref, set by Update module to break dependency *)
+let lowMemoryMode : (unit -> bool) ref = ref (fun () -> false)
+
 let init fastCheck ignorearchives fspath =
   finish ();
   if fastCheck && not ignorearchives then begin
-    begin try
-      debug (fun () -> Util.msg "opening cache file %s for input\n"
-                         (System.fspathToDebugString fspath));
-      let ic = System.open_in_bin fspath in
+    (* In low-memory mode, skip loading the cache into memory.
+       The fingerprint function will fall through to disk-based computation.
+       We still set up writing so future runs can use the cache. *)
+    if not (!lowMemoryMode ()) then begin
       begin try
-        let header = input_line ic in
-        if header <> magic then raise (Sys_error "wrong header");
-        let st = ref "" in
-        while true do read st ic done
-      with
-        Sys_error error ->
-          debug (fun () -> Util.msg "error in loading cache file %s: %s\n"
-                             (System.fspathToDebugString fspath) error)
-      | End_of_file ->
-          ()
-      end;
-      begin try
-        close_in ic
+        debug (fun () -> Util.msg "opening cache file %s for input\n"
+                           (System.fspathToDebugString fspath));
+        let ic = System.open_in_bin fspath in
+        begin try
+          let header = input_line ic in
+          if header <> magic then raise (Sys_error "wrong header");
+          let st = ref "" in
+          while true do read st ic done
+        with
+          Sys_error error ->
+            debug (fun () -> Util.msg "error in loading cache file %s: %s\n"
+                               (System.fspathToDebugString fspath) error)
+        | End_of_file ->
+            ()
+        end;
+        begin try
+          close_in ic
+        with Sys_error error ->
+          debug (fun () -> Util.msg "error in closing cache file %s: %s\n"
+                               (System.fspathToDebugString fspath) error)
+        end;
       with Sys_error error ->
-        debug (fun () -> Util.msg "error in closing cache file %s: %s\n"
-                             (System.fspathToDebugString fspath) error)
-      end;
-    with Sys_error error ->
-      debug (fun () -> Util.msg "could not open cache file %s: %s\n"
-                         (System.fspathToDebugString fspath) error)
-    end;
+        debug (fun () -> Util.msg "could not open cache file %s: %s\n"
+                           (System.fspathToDebugString fspath) error)
+      end
+    end else
+      debug (fun () -> Util.msg "Low-memory mode: skipping cache file loading\n");
     let open_cache_file () =
       try
         debug (fun () -> Util.msg "opening cache file %s for output\n"

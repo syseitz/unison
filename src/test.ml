@@ -876,6 +876,43 @@ let test() =
     );
   end;
 
+    (* Test low-memory mode *)
+    if bothRootsLocal then begin
+      runtest "lowmemory: basic sync" ["lowmemory = true"] (fun () ->
+        put R1 (Dir []); put R2 (Dir []); sync ();
+        let r1 = ["a", File "hello"; "b", File "world";
+                   "d", Dir ["x", File "nested"; "y", File "files"]] in
+        put R1 (Dir r1); sync ();
+        check "1" R2 (Dir r1);
+        (* Modify a file *)
+        put R1 (Dir ["a", File "hello modified"; "b", File "world";
+                      "d", Dir ["x", File "nested"; "y", File "files"]]);
+        sync ();
+        check "2" R2 (Dir ["a", File "hello modified"; "b", File "world";
+                           "d", Dir ["x", File "nested"; "y", File "files"]]);
+        (* Delete a file *)
+        put R1 (Dir ["b", File "world";
+                      "d", Dir ["x", File "nested"; "y", File "files"]]);
+        sync ();
+        check "3" R2 (Dir ["b", File "world";
+                           "d", Dir ["x", File "nested"; "y", File "files"]]);
+      );
+
+      runtest "lowmemory: mixed mode" [] (fun () ->
+        (* Start with lowmemory=false to create traditional archives *)
+        put R1 (Dir []); put R2 (Dir []); sync ();
+        let fs = Dir ["a", File "aaa"; "d", Dir ["b", File "bbb"]] in
+        put R1 fs; sync ();
+        check "1" R2 fs;
+        (* Now enable lowmemory - should migrate and continue working *)
+        Prefs.set Update.lowmemory true;
+        put R1 (Dir ["a", File "aaa changed"; "d", Dir ["b", File "bbb"]]);
+        sync ();
+        check "2" R2 (Dir ["a", File "aaa changed"; "d", Dir ["b", File "bbb"]]);
+        Prefs.set Update.lowmemory false;
+      );
+    end;
+
   if !failures = 0 then
     Util.msg "Success :-)\n"
   else

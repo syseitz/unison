@@ -41,6 +41,14 @@ type handle = Os.fullfingerprint
 (* map(fingerprint, path) *)
 let fingerprint2pathMap = FPMap.create 10000
 
+(* Maximum number of entries in low-memory mode.
+   The xferhint is a pure optimization (copy-by-move detection),
+   not required for correctness. *)
+let lowMemMaxEntries = 100000
+
+(* Reference to lowmemory pref, set by Update module to break dependency *)
+let lowMemoryMode : (unit -> bool) ref = ref (fun () -> false)
+
 let deleteEntry fp =
   debug (fun () ->
     Util.msg "deleteEntry: fp=%s\n" (Os.fullfingerprint_to_string fp));
@@ -58,6 +66,14 @@ let lookup fp =
 
 let insertEntry fspath path fp =
   if Prefs.read xferbycopying && not (Os.isPseudoFingerprint fp) then begin
+    (* In low-memory mode, limit the FPMap size *)
+    if !lowMemoryMode () && FPMap.length fingerprint2pathMap >= lowMemMaxEntries
+    then begin
+      debug (fun () ->
+        Util.msg "Low-memory mode: clearing xferhint map (exceeded %d entries)\n"
+          lowMemMaxEntries);
+      FPMap.clear fingerprint2pathMap
+    end;
     debug (fun () ->
       Util.msg "insertEntry: fspath=%s, path=%s, fp=%s\n"
         (Fspath.toDebugString fspath)

@@ -26,3 +26,6 @@ val ressClearlyUnchanged :
   bool -> Fileinfo.t -> 'a Osx.ressInfo -> bool -> bool
 (* Is that a file for which fast checking is disabled? *)
 val excelFile : Path.local -> bool
+
+(* Set the low-memory mode check function (called by Update module) *)
+val lowMemoryMode : (unit -> bool) ref

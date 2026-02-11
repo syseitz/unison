@@ -91,6 +91,35 @@ let build_GUI =
   has_lablgtk3
 let () = if build_GUI then outp "guimaybe: gui"
 
+let has_sqlite3 =
+  let found =
+    match ocamlfind with
+    | Some cmd -> shell ~err_null:true (cmd ^ " query sqlite3") |> not_empty
+    | None -> exists ocaml_libdir "sqlite3"
+  in
+  if not found then
+    info "SQLite3 library not found. Low-memory mode will not be available."
+  else
+    info "SQLite3 library found. Low-memory mode will be available.";
+  found
+
+let () =
+  if has_sqlite3 then begin
+    "CAMLFLAGS" <-+= "-DHAS_SQLITE3";
+    (match ocamlfind with
+     | Some cmd ->
+         "CAMLFLAGS_SQLITE3" <-- shell (cmd ^ " query -format \"-I \"\"%d\"\"\" sqlite3");
+         "OCAMLLIBS_SQLITE3" <-- "sqlite3.cma"
+     | None ->
+         "CAMLFLAGS_SQLITE3" <-- "-I +sqlite3";
+         "OCAMLLIBS_SQLITE3" <-- "sqlite3.cma");
+    "CAMLFLAGS" <-+= ($)"CAMLFLAGS_SQLITE3";
+    "OCAMLLIBS" <-+= ($)"OCAMLLIBS_SQLITE3";
+    "OCAMLINCLUDES" <-+= ($)"CAMLFLAGS_SQLITE3";
+    outp "HAS_SQLITE3 = true"
+  end else
+    outp "HAS_SQLITE3 ="
+
 let build_macGUI =
   if osarch_macos then begin
     (* If XCode is not installed, xcodebuild is just a placeholder telling

@@ -101,3 +101,6 @@ val setStasherFun : (Fspath.t -> Path.local -> unit) -> unit
    presentation of the current fspath with the list of names/fspaths of
    all the roots and the current archive format *)
 val archiveHash : Fspath.t -> string
+
+(* Low-memory mode preference *)
+val lowmemory : bool Prefs.t

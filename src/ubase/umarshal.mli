@@ -50,6 +50,8 @@ val from_string : 'a t -> string -> int -> 'a
 val from_channel : 'a t -> in_channel -> 'a
 val to_channel : 'a t -> out_channel -> 'a -> unit
 
+val write_to : 'a t -> (bytes -> int -> int -> unit) -> 'a -> unit
+
 val rec1 : ('a t -> 'a t) -> 'a t
 val rec2 : ('a t -> 'b t) -> ('b t -> 'a t) -> 'a t * 'b t
 

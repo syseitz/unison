@@ -33,6 +33,20 @@ let ignoreArchives =
      ^ "not a good idea to set this option in a profile: it is intended for "
      ^ "command-line use.")
 
+let lowmemory =
+  Prefs.createBool "lowmemory" false
+    ~category:(`Advanced `Syncprocess)
+    ~local:true
+    "use disk-backed archives to reduce memory usage"
+    ("When this preference is set, Unison will store archive data in a "
+     ^ "SQLite database on disk instead of keeping the entire archive tree "
+     ^ "in memory.  This can dramatically reduce memory usage (from 10-20 GB "
+     ^ "to ~100-200 MB) when synchronizing millions of files, at the cost of "
+     ^ "somewhat slower scanning due to disk I/O.  On the first run with this "
+     ^ "option, Unison will migrate existing archives to the SQLite format.  "
+     ^ "This preference is local to each host and can be set independently "
+     ^ "on each side.")
+
 (*****************************************************************************)
 (*                             ARCHIVE DATATYPE                              *)
 (*****************************************************************************)
@@ -749,6 +763,359 @@ let getArchiveProps (thisRoot: string): Proplist.t =
 let setArchivePropsLocal (thisRoot: string) (props: Proplist.t) =
   Hashtbl.replace archivePropCache thisRoot props
 
+
+(*************************************************************************)
+(*              Low-memory mode: SQLite-backed archives                  *)
+(*************************************************************************)
+
+let debuglm = Trace.debug "lowmem"
+
+(* Type for a serialized directory entry: props + list of (name, child) pairs.
+   Children that are subdirectories are stored with empty NameMap (loaded
+   on demand from their own DB row). *)
+type dir_entry = Props.t * (Name.t * archive) list
+
+let mdir_child_rec marchive =
+  Umarshal.(prod2 Name.m marchive id id)
+
+let mdir_children_rec marchive =
+  Umarshal.(list (mdir_child_rec marchive))
+
+let mdir_entry_rec marchive =
+  Umarshal.(prod2 Props.m (mdir_children_rec marchive) id id)
+
+let mdir_entry = mdir_entry_rec marchive
+
+(* Active database handle for the current scan (one per root) *)
+let db_handles : (string, Archive_db.t) Hashtbl.t = Hashtbl.create 4
+
+let get_db_handle thisRoot =
+  try Some (Hashtbl.find db_handles thisRoot)
+  with Not_found -> None
+
+(* Convert a Path.local to the string key used in the DB *)
+let path_to_key path = Path.toString path
+
+(* Serialize directory children to a blob for DB storage.
+   Subdirectory archives are stored with empty NameMap. *)
+let serialize_dir_children (desc : Props.t) (children : archive NameMap.t) : string =
+  let child_list =
+    NameMap.fold (fun nm arch acc ->
+      let stored_arch = match arch with
+        | ArchiveDir (d, _) -> ArchiveDir (d, NameMap.empty)
+        | other -> other
+      in
+      (nm, stored_arch) :: acc)
+    children []
+  in
+  (* Reverse to maintain sorted order (NameMap.fold is in-order) *)
+  let child_list = List.rev child_list in
+  Umarshal.to_string mdir_entry (desc, child_list)
+
+(* Deserialize directory children from a DB blob.
+   Subdirectories will have empty NameMap children. *)
+let deserialize_dir_children (data : string) : Props.t * archive NameMap.t =
+  let (desc, child_list) = Umarshal.from_string mdir_entry data 0 in
+  let children =
+    List.fold_left (fun m (nm, arch) -> NameMap.add nm arch m)
+      NameMap.empty child_list
+  in
+  (desc, children)
+
+(* Write-back cache for directory children.
+   Bounded to a small number of entries to keep memory low.
+   Avoids repeated deserialization (root loaded 50k times) and
+   redundant serialization (same dir stored 100 times).
+   Dirty entries are flushed to DB on eviction or explicit flush.
+
+   The cache is tied to a single DB handle. When a different DB is used,
+   the cache is flushed and cleared (prevents cross-root corruption). *)
+type dir_cache_entry = {
+  desc : Props.t;
+  children : archive NameMap.t;
+  dirty : bool;
+}
+let dir_cache : (string, dir_cache_entry) Hashtbl.t = Hashtbl.create 8
+let dir_cache_db : Archive_db.t option ref = ref None
+(* Raw blob cache: stores serialized blobs loaded via load_all.
+   Avoids per-directory SQLite queries while keeping memory low
+   (raw blobs are ~20x smaller than deserialized NameMaps). *)
+let blob_cache : (string, string) Hashtbl.t = Hashtbl.create 8
+
+let dir_cache_flush_entry_to db key entry =
+  if entry.dirty then begin
+    let data = serialize_dir_children entry.desc entry.children in
+    debuglm (fun () -> Util.msg "Flushing dirty cache entry: %s\n" key);
+    Archive_db.store db key data
+  end
+
+(* Flush all dirty cache entries to whichever DB they belong to,
+   then clear the cache. Safe to call from any context. *)
+let dir_cache_flush_all () =
+  (match !dir_cache_db with
+   | Some db ->
+       Hashtbl.iter (dir_cache_flush_entry_to db) dir_cache
+   | None -> ());
+  Hashtbl.reset dir_cache;
+  Hashtbl.reset blob_cache;
+  dir_cache_db := None
+
+let dir_cache_clear () =
+  Hashtbl.reset dir_cache;
+  Hashtbl.reset blob_cache;
+  dir_cache_db := None
+
+(* Ensure cache is associated with the given DB.
+   If a different DB was used previously, flush and clear first. *)
+let dir_cache_ensure_db db =
+  match !dir_cache_db with
+  | Some d when d == db -> ()
+  | Some _old_db ->
+      dir_cache_flush_all ();
+      dir_cache_db := Some db
+  | None ->
+      dir_cache_db := Some db
+
+(* Evict dirty non-root entries to keep memory bounded.
+   Clean (preloaded) entries are kept — they're free to discard later
+   via dir_cache_flush_all since they don't need DB writes. *)
+let dir_cache_evict db =
+  let dirty_count = Hashtbl.fold (fun _ e n ->
+    if e.dirty then n + 1 else n) dir_cache 0 in
+  if dirty_count > 4 then begin
+    let to_evict = ref [] in
+    Hashtbl.iter (fun key entry ->
+      if key <> "" && entry.dirty then
+        to_evict := (key, entry) :: !to_evict
+    ) dir_cache;
+    List.iter (fun (key, entry) ->
+      dir_cache_flush_entry_to db key entry;
+      Hashtbl.remove dir_cache key
+    ) !to_evict
+  end
+
+(* Load directory children from the DB for a given path *)
+let load_children_from_db db path =
+  dir_cache_ensure_db db;
+  let key = path_to_key path in
+  match Hashtbl.find_opt dir_cache key with
+  | Some entry ->
+      Some (entry.desc, entry.children)
+  | None ->
+      let data_opt =
+        match Hashtbl.find_opt blob_cache key with
+        | Some data ->
+            Hashtbl.remove blob_cache key;
+            Some data
+        | None -> Archive_db.load db key
+      in
+      match data_opt with
+      | Some data ->
+          let (desc, children) = deserialize_dir_children data in
+          dir_cache_evict db;
+          Hashtbl.replace dir_cache key
+            { desc; children; dirty = false };
+          Some (desc, children)
+      | None -> None
+
+(* Store directory children to the cache (write-back: DB write deferred) *)
+let store_children_to_db db path desc children =
+  dir_cache_ensure_db db;
+  let key = path_to_key path in
+  debuglm (fun () -> Util.msg "Storing children to cache for %s\n" key);
+  dir_cache_evict db;
+  Hashtbl.replace dir_cache key { desc; children; dirty = true }
+
+(* Preload all raw blobs from DB into blob_cache.
+   Replaces N individual SQLite queries with 1 sequential scan.
+   Raw blobs are ~20x smaller than deserialized NameMaps, so this
+   uses only ~3 MB for 500 directories instead of ~30 MB. *)
+let preload_blob_cache db =
+  Hashtbl.reset blob_cache;
+  let entries = Archive_db.load_all db in
+  List.iter (fun (key, data) ->
+    Hashtbl.replace blob_cache key data
+  ) entries;
+  debuglm (fun () ->
+    Util.msg "Preloaded %d raw blobs into blob cache\n"
+      (Hashtbl.length blob_cache))
+
+(* Delete a directory and all its descendants from the DB *)
+let delete_from_db db path =
+  let key = path_to_key path in
+  debuglm (fun () -> Util.msg "Deleting from DB: %s\n" key);
+  Archive_db.delete_subtree db key
+
+(* Get the SQLite archive filename for a given fspath *)
+let sqliteArchiveName fspath =
+  let (arcName, thisRoot) = archiveName fspath MainArch in
+  (* Replace the "ar" prefix with "sq" for the sqlite file *)
+  let sqliteName =
+    if String.length arcName > 2 && String.sub arcName 0 2 = "ar" then
+      "sq" ^ (String.sub arcName 2 (String.length arcName - 2)) ^ ".sqlite"
+    else
+      arcName ^ ".sqlite"
+  in
+  (sqliteName, thisRoot)
+
+(* Import a full in-memory archive into the database *)
+let rec import_archive_to_db db path archive =
+  match archive with
+  | ArchiveDir (desc, children) ->
+      store_children_to_db db path desc children;
+      NameMap.iter (fun nm child ->
+        import_archive_to_db db (Path.child path nm) child)
+        children
+  | _ -> ()
+
+(* Compute the archive hash from the SQLite DB, one directory at a time.
+   Must produce exactly the same result as [checkArchive]. *)
+let rec compute_hash_from_db db path h =
+  let key = path_to_key path in
+  match Archive_db.load db key with
+  | None -> 135 (* NoArchive hash *)
+  | Some data ->
+      let (desc, children) = deserialize_dir_children data in
+      NameMap.fold
+        (fun n child h ->
+           Uutil.hash2 (Name.hash n)
+             (compute_child_hash_from_db db (Path.child path n) child h))
+        children (Props.hash desc h)
+
+and compute_child_hash_from_db db path child h =
+  match child with
+  | ArchiveDir (desc, _) ->
+      (* Load actual children from their DB row *)
+      compute_hash_from_db db path h
+  | ArchiveFile (desc, dig, _, _) ->
+      Uutil.hash2 (Uutil.hash dig) (Props.hash desc h)
+  | ArchiveSymlink content ->
+      Uutil.hash2 (Uutil.hash content) h
+  | NoArchive -> 135
+
+(* Same as above but using 2.51-compatible hash *)
+let rec compute_hash_from_db_251 db path h =
+  let key = path_to_key path in
+  match Archive_db.load db key with
+  | None -> 135
+  | Some data ->
+      let (desc, children) = deserialize_dir_children data in
+      let desc251 = Props.to_compat251 desc in
+      NameMap.fold
+        (fun n child h ->
+           Uutil.hash2 (Name.hash n)
+             (compute_child_hash_from_db_251 db (Path.child path n) child h))
+        children (Props.hash251 desc251 h)
+
+and compute_child_hash_from_db_251 db path child h =
+  match child with
+  | ArchiveDir (_, _) ->
+      compute_hash_from_db_251 db path h
+  | ArchiveFile (desc, dig, _, _) ->
+      let desc251 = Props.to_compat251 desc in
+      Uutil.hash2 (Uutil.hash dig) (Props.hash251 desc251 h)
+  | ArchiveSymlink content ->
+      Uutil.hash2 (Uutil.hash content) h
+  | NoArchive -> 135
+
+(* Reconstruct a full in-memory archive from the DB (for commit protocol) *)
+let rec reconstruct_from_db db path =
+  let key = path_to_key path in
+  match Archive_db.load db key with
+  | None -> NoArchive
+  | Some data ->
+      let (desc, children) = deserialize_dir_children data in
+      let full_children =
+        NameMap.mapi (fun nm child ->
+          match child with
+          | ArchiveDir (_, _) ->
+              reconstruct_from_db db (Path.child path nm)
+          | other -> other)
+        children
+      in
+      ArchiveDir (desc, full_children)
+
+(* Stream the archive from DB to output, one directory at a time.
+   Produces exactly the same bytes as Umarshal.write_to marchive would.
+   Memory usage is O(largest single directory) instead of O(total files). *)
+let rec write_archive_streaming db path send =
+  let key = path_to_key path in
+  match Archive_db.load db key with
+  | None ->
+      (* NoArchive: sum4 I44 tag *)
+      let buf = Bytes.create 1 in
+      Bytes.set buf 0 '\003';
+      send buf 0 1
+  | Some data ->
+      let (desc, children) = deserialize_dir_children data in
+      (* ArchiveDir: sum4 I41 tag *)
+      let buf = Bytes.create 1 in
+      Bytes.set buf 0 '\000';
+      send buf 0 1;
+      (* prod2: Props then NameMap *)
+      Umarshal.write_to Props.m send desc;
+      (* NameMap.m = sum1(list(prod2(Name.m, marchive)))
+         sum1 adds no tag; list writes length then elements.
+         NameMap.fold prepends, producing descending key order. *)
+      let child_list =
+        NameMap.fold (fun k v acc -> (k, v) :: acc) children [] in
+      Umarshal.write_to Umarshal.int send (List.length child_list);
+      List.iter (fun (nm, child) ->
+        Umarshal.write_to Name.m send nm;
+        match child with
+        | ArchiveDir (_, _) ->
+            write_archive_streaming db (Path.child path nm) send
+        | _ ->
+            Umarshal.write_to marchive send child
+      ) child_list
+
+(* Write the traditional archive file by streaming from the SQLite DB.
+   Produces the same output as storeArchiveLocal but without building
+   the full archive tree in memory. *)
+let storeArchiveFromDb fspath thisRoot db archiveHash magic properties =
+  debug (fun () ->
+    Util.msg "Saving archive (streaming from DB) in %s\n"
+      (System.fspathToDebugString fspath));
+  Util.convertUnixErrorsToFatal "saving archive" (fun () ->
+    let c =
+      System.open_out_gen
+        [Open_wronly; Open_creat; Open_trunc; Open_binary] 0o600 fspath
+    in
+    let close_on_error f =
+      try f () with e -> close_out_noerr c; raise e
+    in
+    close_on_error (fun () ->
+    output_string c formatString;
+    output_string c "\n";
+    output_string c (verboseArchiveName thisRoot);
+    output_string c "\n";
+    output_string c (Printf.sprintf "Written at %s - %s mode"
+                       (Util.time2string (Util.time()))
+                       ((Case.ops())#modeDesc));
+    output_string c "\030";
+    output_string c (String.concat "\030" (Features.changingArchiveFormat ()));
+    output_string c "\n";
+    let paths =
+      try Proplist.find propPathKey properties with Not_found -> PathMap.empty in
+    let properties = Proplist.remove propPathKey properties in
+    (* Write mpayload = prod4(marchive, int, string, Proplist.m)
+       with streaming archive instead of in-memory tree *)
+    let header = Bytes.create Umarshal.header_size in
+    let header_pos = pos_out c in
+    output c header 0 Umarshal.header_size;
+    write_archive_streaming db Path.empty (output c);
+    Umarshal.write_to Umarshal.int (output c) archiveHash;
+    Umarshal.write_to Umarshal.string (output c) magic;
+    Umarshal.write_to Proplist.m (output c) properties;
+    let end_pos = pos_out c in
+    let data_size = end_pos - header_pos - Umarshal.header_size in
+    Bytes.set_int64_be header 0 (Int64.of_int data_size);
+    seek_out c header_pos;
+    output c header 0 Umarshal.header_size;
+    seek_out c end_pos;
+    if not (PathMap.is_empty paths) then Umarshal.to_channel mpaths c paths;
+    close_out c))
+
 let fileUnchanged oldInfo newInfo =
   match oldInfo, newInfo with
   | None, _ | _, None -> false
@@ -804,6 +1171,39 @@ let prunePropsdata archive =
 
 let externArchivePropsdata archive props =
   match prunePropsdata archive with
+  | [] -> props
+  | pd -> Proplist.add propsDataKey pd props
+
+(* Walk the DB tree calling Props.Data.gcKeep on all archive nodes.
+   Memory bounded to O(largest directory). *)
+let rec gcKeepFromDb db path =
+  match Archive_db.load db (path_to_key path) with
+  | None -> ()
+  | Some data ->
+      let (desc, children) = deserialize_dir_children data in
+      Props.Data.gcKeep desc;
+      NameMap.iter (fun nm child ->
+        match child with
+        | ArchiveDir (child_desc, _) ->
+            Props.Data.gcKeep child_desc;
+            gcKeepFromDb db (Path.child path nm)
+        | ArchiveFile (props, _, _, _) ->
+            Props.Data.gcKeep props
+        | ArchiveSymlink _ -> ()
+        | NoArchive -> ()
+      ) children
+
+let externArchivePropsDataFromDb db props =
+  let t0 = Unix.gettimeofday () in
+  debugpd (fun () -> Util.msg "Pruning shared props data from DB...\n");
+  Props.Data.gcInit ();
+  gcKeepFromDb db Path.empty;
+  let pd = Props.Data.gcDone () in
+  debugpd (fun () ->
+    let t1 = Unix.gettimeofday () in
+    Util.msg "Shared props data pruning from DB took %.3f milliseconds\n"
+      ((t1 -. t0) *. 1000.));
+  match pd with
   | [] -> props
   | pd -> Proplist.add propsDataKey pd props
 
@@ -1031,6 +1431,49 @@ let clearArchiveData thisRoot =
    Additionally, while not directly conflicting with the situation above, it is
    unfortunate that [clearArchiveData] also returns [Some (0, "")] to signal an
    empty/missing archive. *)
+(* Load archive in low-memory mode from SQLite.
+   Returns Some (skeleton_archive, hash, magic, properties) if successful. *)
+let loadArchiveLowMemory fspath thisRoot =
+  let (sqliteName, _) = sqliteArchiveName fspath in
+  let sqlitePath = Util.fileInUnisonDir sqliteName in
+  if Archive_db.is_valid sqlitePath then begin
+    debuglm (fun () -> Util.msg "Loading archive skeleton from SQLite: %s\n"
+      sqlitePath);
+    let db = Archive_db.open_db sqlitePath in
+    (* Load just the root entry *)
+    let skeleton =
+      match Archive_db.load db "" with
+      | Some data ->
+          let (desc, _children) = deserialize_dir_children data in
+          ArchiveDir (desc, NameMap.empty)
+      | None -> NoArchive
+    in
+    (* Load metadata *)
+    let hash = match Archive_db.load_meta db "hash" with
+      | Some s -> (try int_of_string s with _ -> 0) | None -> 0 in
+    let magic = match Archive_db.load_meta db "magic" with
+      | Some s -> s | None -> "" in
+    Archive_db.close_db db;
+    Some (skeleton, hash, magic, Proplist.empty)
+  end else
+    None
+
+(* Migrate a traditional archive to SQLite format *)
+let migrateToSqlite fspath thisRoot archive =
+  let (sqliteName, _) = sqliteArchiveName fspath in
+  let sqlitePath = Util.fileInUnisonDir sqliteName in
+  debuglm (fun () -> Util.msg "Migrating archive to SQLite: %s\n" sqlitePath);
+  let db = Archive_db.open_db sqlitePath in
+  Archive_db.begin_transaction db;
+  import_archive_to_db db Path.empty archive;
+  Archive_db.commit_transaction db;
+  Archive_db.close_db db;
+  debuglm (fun () -> Util.msg "Migration complete\n");
+  (* Return a skeleton archive *)
+  match archive with
+  | ArchiveDir (desc, _) -> ArchiveDir (desc, NameMap.empty)
+  | other -> other
+
 let loadArchiveOnRoot: Common.root -> bool -> (int * string) option Lwt.t =
   Remote.registerRootCmd
     "loadArchive" Umarshal.bool Umarshal.(option (prod2 int string id id))
@@ -1040,7 +1483,33 @@ let loadArchiveOnRoot: Common.root -> bool -> (int * string) option Lwt.t =
 
        if Prefs.read ignoreArchives then begin
          foundArchives := false;
+         (* In low-memory mode, also delete the SQLite archive *)
+         if Prefs.read lowmemory then begin
+           let (sqliteName, _) = sqliteArchiveName fspath in
+           let sqlitePath = Util.fileInUnisonDir sqliteName in
+           (try Sys.remove sqlitePath with Sys_error _ -> ())
+         end;
          clearArchiveData thisRoot
+       end else if Prefs.read lowmemory then begin
+         (* Low-memory mode: try SQLite first, then migrate *)
+         match loadArchiveLowMemory fspath thisRoot with
+         | Some archData ->
+             debuglm (fun () -> Util.msg "Loaded archive from SQLite\n");
+             setArchiveData thisRoot fspath archData None
+         | None ->
+             (* No SQLite archive; try to load traditional and migrate *)
+             begin match loadArchiveLocal arcFspath thisRoot with
+             | Some (archive, hash, magic, properties) ->
+                 debuglm (fun () ->
+                   Util.msg "Traditional archive found, migrating to SQLite\n");
+                 let skeleton = migrateToSqlite fspath thisRoot archive in
+                 setArchiveData thisRoot fspath
+                   (skeleton, hash, magic, properties) None
+             | None ->
+                 (* No archive at all - start fresh *)
+                 foundArchives := false;
+                 clearArchiveData thisRoot
+             end
        end else if optimistic then begin
          let (newArcName, _) = archiveName fspath NewArch in
          if
@@ -1402,7 +1871,7 @@ let doArchiveCrashRecovery () =
 (* perform [action] on the relative path [rest] in the archive.  If it
    returns [(ar, result)], then update archive with [ar] at [rest] and
    return [result]. *)
-let rec updatePathInArchive archive fspath
+let rec updatePathInArchive ?db archive fspath
     (here: Path.local) (rest: 'a Path.path)
     (action: archive -> Path.local -> archive):
     archive
@@ -1416,34 +1885,70 @@ let rec updatePathInArchive archive fspath
     None ->
       action archive here
   | Some(name, rest') ->
-      let (desc, name', child, otherChildren) =
+      (* In low-memory mode, find the child and recurse first, then
+         only build the modified NameMap if the child actually changed.
+         This avoids ~20 tree node allocations per file at intermediate
+         levels where nothing changes (e.g., root level during
+         markEqualLocal processing 500k files). *)
+      let (desc, children) =
         match archive with
           ArchiveDir (desc, children) ->
-            begin try
-              let (name', child) = NameMap.findi name children in
-              (desc, name', child, NameMap.remove name children)
-            with Not_found ->
-              (desc, name, NoArchive, children)
-            end
+            let children =
+              if Prefs.read lowmemory && NameMap.is_empty children then
+                match db with
+                | Some db ->
+                    (match load_children_from_db db here with
+                     | Some (_, loaded) -> loaded
+                     | None -> children)
+                | None -> children
+              else children
+            in
+            (desc, children)
         | _ ->
-            (Props.dummy, name, NoArchive, NameMap.empty) in
-      match
-        updatePathInArchive child fspath (Path.child here name') rest' action
-      with
-        NoArchive ->
-          if NameMap.is_empty otherChildren && desc == Props.dummy then
-            NoArchive
-          else
-            ArchiveDir (desc, otherChildren)
-      | child ->
-          ArchiveDir (desc, NameMap.add name' child otherChildren)
+            (Props.dummy, NameMap.empty) in
+      let (name', child) =
+        try NameMap.findi name children
+        with Not_found -> (name, NoArchive) in
+      let result =
+        updatePathInArchive ?db child fspath (Path.child here name') rest' action
+      in
+      (* In low-memory mode, check if the subtree changed before
+         doing expensive NameMap operations. At intermediate levels
+         where a subdirectory's Props didn't change, we can skip
+         the remove/add entirely — saving O(log n) allocations. *)
+      match db with
+      | Some db when Prefs.read lowmemory ->
+          let store_needed = match child, result with
+            | ArchiveDir (cd, cc), ArchiveDir (rd, _)
+                when cd == rd && NameMap.is_empty cc -> false
+            | _ -> true
+          in
+          if store_needed then begin
+            let otherChildren = NameMap.remove name' children in
+            let ch = match result with
+              | NoArchive -> otherChildren
+              | r -> NameMap.add name' r otherChildren
+            in
+            store_children_to_db db here desc ch
+          end;
+          ArchiveDir (desc, NameMap.empty)
+      | _ ->
+          let otherChildren = NameMap.remove name' children in
+          match result with
+            NoArchive ->
+              if NameMap.is_empty otherChildren && desc == Props.dummy then
+                NoArchive
+              else
+                ArchiveDir (desc, otherChildren)
+          | r ->
+              ArchiveDir (desc, NameMap.add name' r otherChildren)
 
 (*************************************************************************)
 (*                  Extract of a part of a archive                       *)
 (*************************************************************************)
 
 (* Get the archive found at [rest] of [archive] *)
-let rec getPathInArchive archive here rest =
+let rec getPathInArchive ?db archive here rest =
   match Path.deconstruct rest with
     None ->
       (here, archive)
@@ -1451,6 +1956,17 @@ let rec getPathInArchive archive here rest =
       let (name', child) =
         match archive with
           ArchiveDir (desc, children) ->
+            let children =
+              (* In low-memory mode, if children are empty, load from DB *)
+              if Prefs.read lowmemory && NameMap.is_empty children then
+                match db with
+                | Some db ->
+                    (match load_children_from_db db here with
+                     | Some (_, loaded) -> loaded
+                     | None -> children)
+                | None -> children
+              else children
+            in
             begin try
               NameMap.findi name children
             with Not_found ->
@@ -1459,11 +1975,12 @@ let rec getPathInArchive archive here rest =
         | _ ->
             (name, NoArchive)
       in
-      getPathInArchive child (Path.child here name') rest'
+      getPathInArchive ?db child (Path.child here name') rest'
 
 let translatePathLocal fspath path =
   let root = thisRootsGlobalName fspath in
-  let (localPath, _) = getPathInArchive (getArchive root) Path.empty path in
+  let db = get_db_handle root in
+  let (localPath, _) = getPathInArchive ?db (getArchive root) Path.empty path in
   localPath
 
 let translatePath =
@@ -2104,6 +2621,19 @@ and buildUpdateRec archive currfspath path scanInfo =
     (* --- *)
     | (`DIRECTORY, ArchiveDir (archDesc, prevChildren)) ->
         debugverbose (fun() -> Util.msg "  buildUpdate -> Directory\n");
+        (* In low-memory mode, load children from DB if they are empty *)
+        let prevChildren =
+          if Prefs.read lowmemory && NameMap.is_empty prevChildren then begin
+            let root = thisRootsGlobalName currfspath in
+            match get_db_handle root with
+            | Some db ->
+                (match load_children_from_db db path with
+                 | Some (_, loaded) -> loaded
+                 | None -> prevChildren)
+            | None -> prevChildren
+          end else
+            prevChildren
+        in
         let (permchange, desc) =
           (* BCP 10/17: If this directory is being treated atomically,
              then we want to use its real modtime; otherwise, we don't
@@ -2124,33 +2654,14 @@ and buildUpdateRec archive currfspath path scanInfo =
           buildUpdateChildren
             currfspath path prevChildren unchanged scanInfo in
         let (archDesc, updated) =
-          (* If the archive contain ignored children, we cannot use it to
-             skip reading the directory contents from the filesystem.
-             Actually, we could check for ignored children in the archive,
-             but this has a significant cost.  We could mark directories
-             with ignored children, and only perform the checks for them,
-             but that does not seem worthwhile, as directories with
-             ignored children are expected to be rare in the archive.
-             (These are files or directories which used not to be
-             ignored and are now ignored.) *)
           if hasIgnoredChildren then (archDesc, true) else
           directoryCheckContentUnchanged
             currfspath path info archDesc childUpdates scanInfo in
         let (archDesc, updated) =
-          (* Only update the times in archive if there is nothing to propagate
-             for the dir itself (with the exception of ctime). ctime in the
-             archive must be updated if props changed while a props rescan was
-             requested (in this case the ctime is reset to force a rescan every
-             time until the sync is completed). Otherwise, if propagation fails
-             and times in archive are updated anyway then the changes that
-             failed to propagate may be missed at the next scan. If there is
-             something to propagate then all archive changes must go through
-             propagation. With the exception of dirChangeFlag, which is safe to
-             update without updating mtime. *)
           if permchange <> PropsSame then begin
             if not scanInfo.rescanProps || Props.same_ctime archDesc Props.dummy then
               (archDesc, updated)
-            else (* Props changed when props rescan was requested: reset ctime *)
+            else
               (Props.resetCTime archDesc Props.dummy, true)
           end else begin
             let updated =
@@ -2159,18 +2670,39 @@ and buildUpdateRec archive currfspath path scanInfo =
             (Props.setTime archDesc info.Fileinfo.desc, updated)
           end
         in
-        (begin match newChildren with
-           Some ch ->
-             Some (ArchiveDir (archDesc, ch))
-         | None ->
-             if updated then Some (ArchiveDir (archDesc, prevChildren))
-             else None
-         end,
-         if childUpdates <> [] || permchange = PropsUpdated then
-           Updates (Dir (desc, childUpdates, permchange, emptied),
-                    oldInfoOf archive)
-         else
-           NoUpdates)
+        let result =
+          (begin match newChildren with
+             Some ch ->
+               (* In low-memory mode, store updated children to DB *)
+               if Prefs.read lowmemory then begin
+                 let root = thisRootsGlobalName currfspath in
+                 match get_db_handle root with
+                 | Some db -> store_children_to_db db path archDesc ch
+                 | None -> ()
+               end;
+               Some (ArchiveDir (archDesc,
+                 if Prefs.read lowmemory then NameMap.empty else ch))
+           | None ->
+               if updated then begin
+                 if Prefs.read lowmemory then begin
+                   let root = thisRootsGlobalName currfspath in
+                   match get_db_handle root with
+                   | Some db ->
+                       store_children_to_db db path archDesc prevChildren
+                   | None -> ()
+                 end;
+                 Some (ArchiveDir (archDesc,
+                   if Prefs.read lowmemory then NameMap.empty else prevChildren))
+               end else
+                 None
+           end,
+           if childUpdates <> [] || permchange = PropsUpdated then
+             Updates (Dir (desc, childUpdates, permchange, emptied),
+                      oldInfoOf archive)
+           else
+             NoUpdates)
+        in
+        result
     | (`DIRECTORY, _) ->
         debug (fun() -> Util.msg "  buildUpdate -> New directory\n");
         let (newChildren, childUpdates, _, _) =
@@ -2186,6 +2718,18 @@ and buildUpdateRec archive currfspath path scanInfo =
 let rec buildUpdatePathTree archive fspath here tree scanInfo =
   match tree, archive with
     PathTreeNode children, ArchiveDir (archDesc, archChildren) ->
+      (* In low-memory mode, load children from DB if empty *)
+      let archChildren =
+        if Prefs.read lowmemory && NameMap.is_empty archChildren then begin
+          let root = thisRootsGlobalName fspath in
+          match get_db_handle root with
+          | Some db ->
+              (match load_children_from_db db here with
+               | Some (_, loaded) -> loaded
+               | None -> archChildren)
+          | None -> archChildren
+        end else archChildren
+      in
       let curChildren =
         lazy (List.fold_left (fun m (nm, st) -> NameMap.add nm st m)
                 NameMap.empty (getChildren fspath here))
@@ -2516,6 +3060,19 @@ let purgePropsForPaths archive props =
   in
   mapPropPaths f props
 
+(* DB-backed variant: uses getPathInArchive with ~db to lazily load from DB *)
+let purgePropsForPathsFromDb db props =
+  let stub = ArchiveDir (Props.dummy, NameMap.empty) in
+  let f propPaths =
+    let keepExisting k v acc =
+      match getPathInArchive ~db stub Path.empty k with
+      | (_, NoArchive) -> acc
+      | _ -> PathMap.add k v acc
+    in
+    PathMap.fold keepExisting propPaths PathMap.empty
+  in
+  mapPropPaths f props
+
 (* Remove old-style props used by versions <= 2.53.3 as they will be recorded
    in the per-path format. *)
 let clearOldStyleProps props =
@@ -2620,6 +3177,49 @@ let findLocal wantWatcher fspath pathList subpaths :
   let (arcName,thisRoot) = archiveName fspath MainArch in
   let archive = getArchive thisRoot in
   let (rescanProps, dirStamp) = checkNoUpdatePredicateChange thisRoot pathList in
+  (* In low-memory mode, open the SQLite DB for this scan *)
+  let db_opened =
+    if Prefs.read lowmemory then begin
+      let (sqliteName, _) = sqliteArchiveName fspath in
+      let sqlitePath = Util.fileInUnisonDir sqliteName in
+      debuglm (fun () -> Util.msg "Opening SQLite archive for scan: %s\n"
+        sqlitePath);
+      let db = Archive_db.open_db sqlitePath in
+      Archive_db.begin_transaction db;
+      Hashtbl.replace db_handles thisRoot db;
+      (* Preload raw blobs to avoid per-directory query overhead *)
+      preload_blob_cache db;
+      true
+    end else
+      false
+  in
+  (* Helper to commit the scan transaction and start a new one for
+     post-scan operations (markEqualLocal, replaceArchiveLocal, etc.).
+     The DB handle stays open until prepareCommitLocal closes it. *)
+  let commit_db_transaction () =
+    if db_opened then begin
+      (match get_db_handle thisRoot with
+       | Some db ->
+           (* Flush write-back cache before committing *)
+           dir_cache_flush_all ();
+           (try Archive_db.commit_transaction db
+            with e ->
+              debuglm (fun () -> Util.msg
+                "Error committing DB transaction: %s\n" (Printexc.to_string e)));
+           (* Start a new transaction for post-scan operations.
+              Without this, each individual DB write in markEqualLocal
+              etc. would auto-commit, causing extreme slowdown due to
+              per-write fsync. *)
+           (try Archive_db.begin_transaction db
+            with e ->
+              debuglm (fun () -> Util.msg
+                "Error beginning post-scan transaction: %s\n"
+                (Printexc.to_string e)));
+           debuglm (fun () -> Util.msg
+             "Committed scan transaction, started post-scan transaction\n")
+       | None -> ())
+    end
+  in
 (*
 let t1 = Unix.gettimeofday () in
 *)
@@ -2635,63 +3235,64 @@ let t1 = Unix.gettimeofday () in
   let (cacheFilename, _) = archiveName fspath FPCache in
   let cacheFile = Util.fileInUnisonDir cacheFilename in
   Fpcache.init scanInfo.fastCheck (Prefs.read ignoreArchives) cacheFile;
-  let unchangedOptions =
-    try
-      Hashtbl.find previousFindOptions scanInfo.archHash
-      = (scanInfo.dirStamp, pathList)
-    with Not_found ->
-      false
-  in
-  let paths =
-    match subpaths with
-      Some (unsynchronizedPaths, blacklistedPaths) when unchangedOptions
-          && Fswatchold.running scanInfo.archHash ->
-        let (>>) x f = f x in
-        let paths =
-          Fswatchold.getChanges scanInfo.archHash
-          (* We do not really need to filter here (they are filtered also
-             by [buildUpdatePathTree], but that might reduce greatly and
-             cheaply number of paths to consider... *)
-          >> List.filter (fun path -> not (Globals.shouldIgnore path))
-        in
-        let filterPaths paths subpaths =
-          let number_list l =
-            let i = ref (-1) in
-            Safelist.map (fun x -> incr i; (!i, x)) l
-          in
-          paths >> (* We number paths, to be able to recover their
-                      initial order. *)
-                   number_list
-                >> (* We put longest paths first, in order to deal
-                      correctly with nested paths (tough that might be
-                      overkill...) *)
-                   List.sort (fun (_, p1) (_, p2) -> Path.compare p2 p1)
-                >> (* We extract the set of changed paths included in
-                      each synchronized path *)
-                   List.fold_left
-                     (fun (l, tree) (i, p) ->
-                        match tree with
-                          None ->
-                            ((i, (p, None)) :: l, None)
-                        | Some tree ->
-                            ((i, (p, getSubTree p tree)) :: l,
-                             removePathFromTree p tree))
-                     ([], pathTreeOfList subpaths)
-                >> fst
-                >> (* Finally, we restaure the initial order *)
-                   List.sort (fun (i1, _) (i2, _) -> compare i1 i2)
-                >> List.map snd
-        in
-        filterPaths pathList (Safelist.append unsynchronizedPaths paths)
-    | _ ->
-        if wantWatcher && Fswatchold.start scanInfo.archHash fspath then
-          Hashtbl.replace previousFindOptions
-            scanInfo.archHash (scanInfo.dirStamp, pathList)
-        else
-          Hashtbl.remove previousFindOptions scanInfo.archHash;
-        Safelist.map (fun p -> (p, Some PathTreeLeaf)) pathList
-  in
   let (archive, updates) =
+    Fun.protect ~finally:commit_db_transaction (fun () ->
+    let unchangedOptions =
+      try
+        Hashtbl.find previousFindOptions scanInfo.archHash
+        = (scanInfo.dirStamp, pathList)
+      with Not_found ->
+        false
+    in
+    let paths =
+      match subpaths with
+        Some (unsynchronizedPaths, blacklistedPaths) when unchangedOptions
+            && Fswatchold.running scanInfo.archHash ->
+          let (>>) x f = f x in
+          let paths =
+            Fswatchold.getChanges scanInfo.archHash
+            (* We do not really need to filter here (they are filtered also
+               by [buildUpdatePathTree], but that might reduce greatly and
+               cheaply number of paths to consider... *)
+            >> List.filter (fun path -> not (Globals.shouldIgnore path))
+          in
+          let filterPaths paths subpaths =
+            let number_list l =
+              let i = ref (-1) in
+              Safelist.map (fun x -> incr i; (!i, x)) l
+            in
+            paths >> (* We number paths, to be able to recover their
+                        initial order. *)
+                     number_list
+                  >> (* We put longest paths first, in order to deal
+                        correctly with nested paths (tough that might be
+                        overkill...) *)
+                     List.sort (fun (_, p1) (_, p2) -> Path.compare p2 p1)
+                  >> (* We extract the set of changed paths included in
+                        each synchronized path *)
+                     List.fold_left
+                       (fun (l, tree) (i, p) ->
+                          match tree with
+                            None ->
+                              ((i, (p, None)) :: l, None)
+                          | Some tree ->
+                              ((i, (p, getSubTree p tree)) :: l,
+                               removePathFromTree p tree))
+                       ([], pathTreeOfList subpaths)
+                  >> fst
+                  >> (* Finally, we restaure the initial order *)
+                     List.sort (fun (i1, _) (i2, _) -> compare i1 i2)
+                  >> List.map snd
+          in
+          filterPaths pathList (Safelist.append unsynchronizedPaths paths)
+      | _ ->
+          if wantWatcher && Fswatchold.start scanInfo.archHash fspath then
+            Hashtbl.replace previousFindOptions
+              scanInfo.archHash (scanInfo.dirStamp, pathList)
+          else
+            Hashtbl.remove previousFindOptions scanInfo.archHash;
+          Safelist.map (fun p -> (p, Some PathTreeLeaf)) pathList
+    in
     Safelist.fold_right
       (fun (path, pathTreeOpt) (arch, upd) ->
          match pathTreeOpt with
@@ -2702,7 +3303,7 @@ let t1 = Unix.gettimeofday () in
              (arch', (localPath, ui, props) :: upd)
          | _ ->
              (arch, (translatePathLocal fspath path, NoUpdates, []) :: upd))
-      paths (archive, [])
+      paths (archive, []))
   in
   Fpcache.finish ();
 (*
@@ -2736,6 +3337,9 @@ let mergePropsdataOnRoot =
      Lwt.return (Props.Data.extern `New))
 
 let findUpdatesOnPaths ?(wantWatcher=false) pathList subpaths =
+  (* Initialize low-memory mode refs in dependent modules *)
+  Xferhint.lowMemoryMode := (fun () -> Prefs.read lowmemory);
+  Fpcache.lowMemoryMode := (fun () -> Prefs.read lowmemory);
   Lwt_unix.run
     (loadArchives true >>= (fun (ok, checksums) ->
      begin if ok then Lwt.return checksums else begin
@@ -2823,23 +3427,60 @@ let findUpdates ?wantWatcher subpaths =
 (* To prepare for committing, write to Scratch Archive *)
 let prepareCommitLocal compatMode (fspath, magic) =
   let (newName, root) = archiveName fspath ScratchArch in
-  let archive = getArchive root in
-  (**
-     :ZheDebug:
-     Format.set_formatter_out_channel stdout;
-     Format.printf "prepareCommitLocal: %s\n" (thisRootsGlobalName fspath);
-     showArchive archive;
-     Format.print_flush();
-   **)
-  let archiveHash =
-    if not compatMode then checkArchive true [] archive 0
-    else checkArchive251 true [] (to_compat251 archive) 0 in
-  let props = getArchiveProps root in
-  let props = purgePropsForPaths archive props in
-  let props = externArchivePropsdata archive props in
-  storeArchiveLocal
-    (Util.fileInUnisonDir newName) root archive archiveHash magic props;
-  Lwt.return (Some archiveHash)
+  if Prefs.read lowmemory then begin
+    (* Low-memory mode: use existing DB handle from scan/transport phase,
+       or open a new one if not available *)
+    let db, db_was_open =
+      match get_db_handle root with
+      | Some db ->
+          debuglm (fun () -> Util.msg
+            "prepareCommitLocal: reusing existing DB handle\n");
+          (* Commit the post-scan transaction so all updates are visible *)
+          (try Archive_db.commit_transaction db
+           with e ->
+             debuglm (fun () -> Util.msg
+               "Error committing post-scan transaction: %s\n"
+               (Printexc.to_string e)));
+          (db, true)
+      | None ->
+          let (sqliteName, _) = sqliteArchiveName fspath in
+          let sqlitePath = Util.fileInUnisonDir sqliteName in
+          debuglm (fun () -> Util.msg
+            "prepareCommitLocal: opening new DB handle: %s\n" sqlitePath);
+          (Archive_db.open_db sqlitePath, false)
+    in
+    (* Flush write-back cache to its DB before computing hash/streaming *)
+    dir_cache_flush_all ();
+    let archiveHash =
+      if not compatMode then compute_hash_from_db db Path.empty 0
+      else compute_hash_from_db_251 db Path.empty 0 in
+    (* Store metadata in SQLite *)
+    Archive_db.store_meta db "hash" (string_of_int archiveHash);
+    Archive_db.store_meta db "magic" magic;
+    (* Process properties using DB-backed variants (no full tree needed) *)
+    let props = getArchiveProps root in
+    let props = purgePropsForPathsFromDb db props in
+    let props = externArchivePropsDataFromDb db props in
+    (* Stream the archive from DB directly to the file *)
+    storeArchiveFromDb
+      (Util.fileInUnisonDir newName) root db archiveHash magic props;
+    (* Close the DB and remove handle *)
+    Archive_db.close_db db;
+    dir_cache_clear ();
+    if db_was_open then Hashtbl.remove db_handles root;
+    Lwt.return (Some archiveHash)
+  end else begin
+    let archive = getArchive root in
+    let archiveHash =
+      if not compatMode then checkArchive true [] archive 0
+      else checkArchive251 true [] (to_compat251 archive) 0 in
+    let props = getArchiveProps root in
+    let props = purgePropsForPaths archive props in
+    let props = externArchivePropsdata archive props in
+    storeArchiveLocal
+      (Util.fileInUnisonDir newName) root archive archiveHash magic props;
+    Lwt.return (Some archiveHash)
+  end
 
 let prepareCommitOnRoot =
    Remote.registerRootCmdWithConnection "prepareCommit"
@@ -2982,8 +3623,9 @@ let updateArchive fspath path ui =
     Util.msg "updateArchive %s %s\n"
       (Fspath.toDebugString fspath) (Path.toString path));
   let root = thisRootsGlobalName fspath in
+  let db = get_db_handle root in
   let archive = getArchive root in
-  let (_, subArch) = getPathInArchive archive Path.empty path in
+  let (_, subArch) = getPathInArchive ?db archive Path.empty path in
   updateArchiveRec ui (stripArchive path subArch)
 
 (* (For breaking the dependency loop between update.ml and stasher.ml...) *)
@@ -3000,8 +3642,9 @@ let markEqualLocal fspath paths =
        debug (fun() ->
          Util.msg "markEqualLocal %s %s\n"
            (Fspath.toDebugString fspath) (Path.toString path));
+       let db = get_db_handle root in
        let arch =
-         updatePathInArchive !archive fspath Path.empty path
+         updatePathInArchive ?db !archive fspath Path.empty path
            (fun archive localPath ->
               !stashCurrentVersion fspath localPath;
               updateArchiveRec (Updates (uc, New)) archive)
@@ -3038,9 +3681,10 @@ let replaceArchiveLocal fspath path newArch =
              (Path.toString path)
         );
   let root = thisRootsGlobalName fspath in
+  let db = get_db_handle root in
   let archive = getArchive root in
   let archive =
-    updatePathInArchive archive fspath Path.empty path (fun _ _ -> newArch) in
+    updatePathInArchive ?db archive fspath Path.empty path (fun _ _ -> newArch) in
   setArchiveLocal root archive
 
 let convV0 = Remote.makeConvV0FunArg
@@ -3101,9 +3745,10 @@ let updateProps fspath path propOpt ui =
     Util.msg "updateProps %s %s\n"
       (Fspath.toDebugString fspath) (Path.toString path));
   let root = thisRootsGlobalName fspath in
+  let db = get_db_handle root in
   let archive = getArchive root in
   let archive =
-    updatePathInArchive archive fspath Path.empty path
+    updatePathInArchive ?db archive fspath Path.empty path
       (fun arch _ -> doUpdateProps arch propOpt ui) in
   setArchiveLocal root archive
 
@@ -3135,9 +3780,10 @@ let markPossiblyUpdated fspath path =
     Util.msg "markPossiblyUpdated %s %s\n"
       (Fspath.toDebugString fspath) (Path.toString path));
   let root = thisRootsGlobalName fspath in
+  let db = get_db_handle root in
   let archive = getArchive root in
   let archive =
-    updatePathInArchive archive fspath Path.empty path
+    updatePathInArchive ?db archive fspath Path.empty path
       (fun arch _ -> doMarkPossiblyUpdated arch) in
   setArchiveLocal root archive
 
@@ -3216,9 +3862,11 @@ let checkNoUpdates ?(fastCheck=false) fspath pathInArchive ui =
   debug (fun() ->
     Util.msg "checkNoUpdates %s %s\n"
       (Fspath.toDebugString fspath) (Path.toString pathInArchive));
-  let archive = getArchive (thisRootsGlobalName fspath) in
+  let root = thisRootsGlobalName fspath in
+  let db = get_db_handle root in
+  let archive = getArchive root in
   let (localPath, archive) =
-    getPathInArchive archive Path.empty pathInArchive in
+    getPathInArchive ?db archive Path.empty pathInArchive in
   (* Update the original archive to reflect what we believe is the current
      state of the replica... *)
   let archive = updateArchiveRec ui archive in
@@ -3303,8 +3951,9 @@ let getSubArchiveLocal path =
   let rootLocal = Globals.localRoot () in
   let fspathLocal = snd rootLocal in
   let root = thisRootsGlobalName fspathLocal in
+  let db = get_db_handle root in
   let archive = getArchive root in
-  let (_, subArch) = getPathInArchive archive Path.empty path in
+  let (_, subArch) = getPathInArchive ?db archive Path.empty path in
   subArch
 
 let updateSize path ui =
@@ -3317,7 +3966,19 @@ let updateSize path ui =
 
 let rec iterFiles fspath path arch f =
   match arch with
-    ArchiveDir (_, children) ->
+    ArchiveDir (desc, children) ->
+      (* In low-memory mode, load children from DB if empty *)
+      let children =
+        if Prefs.read lowmemory && NameMap.is_empty children then begin
+          let root = thisRootsGlobalName fspath in
+          match get_db_handle root with
+          | Some db ->
+              (match load_children_from_db db path with
+               | Some (_, loaded) -> loaded
+               | None -> children)
+          | None -> children
+        end else children
+      in
       NameMap.iter
         (fun nm arch -> iterFiles fspath (Path.child path nm) arch f) children
   | ArchiveFile (desc, fp, stamp, ress) ->

@@ -19,3 +19,6 @@ val insertEntry: Fspath.t -> Path.local -> Os.fullfingerprint -> unit
 
 (* Delete an entry *)
 val deleteEntry: handle -> unit
+
+(* Set the low-memory mode check function (called by Update module) *)
+val lowMemoryMode : (unit -> bool) ref

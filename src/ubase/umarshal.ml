@@ -69,6 +69,8 @@ let from_channel m ic =
   really_input ic header 0 header_size;
   m.read (really_input ic)
 
+let write_to m send x = m.write send x
+
 let to_channel m oc x =
   let header = Bytes.create header_size in
   let header_pos = pos_out oc in
