@@ -125,6 +125,8 @@ let () =
     (match ocamlfind with
      | Some cmd ->
          "CAMLFLAGS_SQLITE3" <-- shell (cmd ^ " query -format \"-I \"\"%d\"\"\" sqlite3");
+         let sqlite3_dir = shell (cmd ^ " query sqlite3") in
+         "SQLITE3_STUBS_LIB" <-- sqlite3_dir ^ "/libsqlite3_stubs.a";
          "OCAMLLIBS_SQLITE3" <-- "sqlite3.cma"
      | None ->
          let prefix = env.$("OPAM_SWITCH_PREFIX") in
@@ -134,6 +136,7 @@ let () =
            else ocaml_libdir ^ "/sqlite3"
          in
          "CAMLFLAGS_SQLITE3" <-- "-I " ^ sqlite3_dir;
+         "SQLITE3_STUBS_LIB" <-- sqlite3_dir ^ "/libsqlite3_stubs.a";
          "OCAMLLIBS_SQLITE3" <-- "sqlite3.cma");
     "CAMLFLAGS" <-+= ($)"CAMLFLAGS_SQLITE3";
     outp "HAS_SQLITE3 = true"

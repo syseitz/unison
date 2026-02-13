@@ -476,6 +476,7 @@
 					"-lthreadsnat",
 					"$(OCAMLLIB_STR)",
 					"-lasmrun",
+					"-lsqlite3",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = edu.upenn.cis.Unison;
 				PRODUCT_NAME = Unison;
@@ -507,6 +508,7 @@
 					"-lthreadsnat",
 					"$(OCAMLLIB_STR)",
 					"-lasmrun",
+					"-lsqlite3",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = edu.upenn.cis.Unison;
 				PRODUCT_NAME = Unison;
@@ -536,6 +538,7 @@
 					"-lthreadsnat",
 					"$(OCAMLLIB_STR)",
 					"-lasmrun",
+					"-lsqlite3",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = edu.upenn.cis.Unison;
 				PRODUCT_NAME = Unison;

@@ -233,7 +233,7 @@ $(NAME_FSM)$(EXEC_EXT): $(COMPAT_OBJS) $(CAMLOBJS_FSM) $(FSMCOBJS)
 $(NAME)-blob.o: $(COMPAT_OBJS) $(CAMLOBJS) $(CAMLOBJS_MAC) $(COBJS)
 	@echo Linking $@
 	$(CAMLC) -dstartup -output-obj -verbose -cclib -keep_private_externs $(CAMLFLAGS_X) -o u-b.o $(CAMLLDFLAGS) $(CAMLLIBS) $(CAMLLIBS_SQLITE3) $(CAMLLIBS_MAC) $(CLIBS) $(COMPAT_OBJS) $(CAMLOBJS) $(CAMLOBJS_MAC)
-	$(LD) -r -keep_private_externs -o $@ u-b.o $(COBJS)
+	$(LD) -r -keep_private_externs -o $@ u-b.o $(COBJS) $(SQLITE3_STUBS_LIB)
 	$(RM) u-b.o
 
 ####################################################################
