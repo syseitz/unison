@@ -17,6 +17,8 @@
 
 (* SQLite-backed key-value storage for low-memory archive mode. *)
 
+let available = true
+
 let debug = Trace.debug "archivedb"
 
 type t = {

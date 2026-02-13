@@ -876,8 +876,8 @@ let test() =
     );
   end;
 
-    (* Test low-memory mode *)
-    if bothRootsLocal then begin
+    (* Test low-memory mode (only when sqlite3 is compiled in) *)
+    if bothRootsLocal && Archive_db.available then begin
       runtest "lowmemory: basic sync" ["lowmemory = true"] (fun () ->
         put R1 (Dir []); put R2 (Dir []); sync ();
         let r1 = ["a", File "hello"; "b", File "world";

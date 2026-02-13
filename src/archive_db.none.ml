@@ -2,6 +2,8 @@
 (* Stub implementation when sqlite3-ocaml is not available.
    All database operations raise a fatal error. *)
 
+let available = false
+
 type t = unit
 
 let no_sqlite3 () =

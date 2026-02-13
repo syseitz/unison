@@ -5,6 +5,9 @@
 
 type t
 
+(* Whether SQLite support was compiled in *)
+val available : bool
+
 val open_db : string -> t
 val reset_stmts : t -> unit
 val close_db : t -> unit
