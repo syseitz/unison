@@ -136,8 +136,6 @@ let () =
          "CAMLFLAGS_SQLITE3" <-- "-I " ^ sqlite3_dir;
          "OCAMLLIBS_SQLITE3" <-- "sqlite3.cma");
     "CAMLFLAGS" <-+= ($)"CAMLFLAGS_SQLITE3";
-    "OCAMLLIBS" <-+= ($)"OCAMLLIBS_SQLITE3";
-    "OCAMLINCLUDES" <-+= ($)"CAMLFLAGS_SQLITE3";
     outp "HAS_SQLITE3 = true"
   end else
     outp "HAS_SQLITE3 ="
@@ -292,6 +290,11 @@ let () =
     "CAMLLIBS_MAC" <-- "$(OCAMLLIBS_MAC)";
     "CAMLLIBS_FSM" <-- "$(FSMOCAMLLIBS)";
   end
+
+(* SQLite3 link library (must come after native/bytecode decision) *)
+let () =
+  if has_sqlite3 then
+    "CAMLLIBS_SQLITE3" <-- (if native then "sqlite3.cmxa" else "sqlite3.cma")
 
 (* Compiler compatibility *)
 (* To be used in exceptional cases; the first priority is to not require
