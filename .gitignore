@@ -61,3 +61,7 @@ src/DEPENDENCIES.ps
 _build
 .merlin
 *.install
+
+# Ralph autonomous development
+.ralph/
+.ralphrc

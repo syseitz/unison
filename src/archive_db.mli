@@ -24,10 +24,11 @@ val commit_transaction : t -> unit
 val store_meta : t -> string -> string -> unit
 val load_meta : t -> string -> string option
 
-(* Load all directory entries in one query.
-   Returns list of (path, data) pairs. Much faster than
-   individual loads when all entries are needed. *)
-val load_all : t -> (string * string) list
+(* Iterate over all directory entries in one query.
+   Calls [f path data] for each entry. Much faster than
+   individual loads when all entries are needed.
+   Does not build an intermediate list. *)
+val iter_all : t -> (string -> string -> unit) -> unit
 
 (* Check if a valid database exists at the given path *)
 val is_valid : string -> bool

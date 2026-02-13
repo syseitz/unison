@@ -144,7 +144,22 @@ let rec write ?(tries = 1) state =
 
 (* Start and finish dealing with the cache *)
 
+let fp_hits = ref 0
+let fp_misses = ref 0
+let dataClearlyUnchanged_fail_reason = ref [| 0; 0; 0; 0; 0 |]
+let dataClearlyUnchanged_ok = ref 0
+
 let finish () =
+  if !fp_hits + !fp_misses > 0 then
+    Util.msg "FPCACHE: hits=%d misses=%d (total=%d, hit_rate=%.1f%%)\n"
+      !fp_hits !fp_misses (!fp_hits + !fp_misses)
+      (100. *. float_of_int !fp_hits /. float_of_int (!fp_hits + !fp_misses));
+  let r = !dataClearlyUnchanged_fail_reason in
+  Util.msg "FPCACHE_DCU: ok=%d fail=[nofast=%d time=%d len=%d excel=%d inode=%d]\n"
+    !dataClearlyUnchanged_ok r.(0) r.(1) r.(2) r.(3) r.(4);
+  dataClearlyUnchanged_fail_reason := [| 0; 0; 0; 0; 0 |];
+  dataClearlyUnchanged_ok := 0;
+  fp_hits := 0; fp_misses := 0;
   PathTbl.clear tbl;
   match !state with
     Some st -> if st.queue <> [] then write st;
@@ -159,10 +174,14 @@ let lowMemoryMode : (unit -> bool) ref = ref (fun () -> false)
 let init fastCheck ignorearchives fspath =
   finish ();
   if fastCheck && not ignorearchives then begin
-    (* In low-memory mode, skip loading the cache into memory.
-       The fingerprint function will fall through to disk-based computation.
-       We still set up writing so future runs can use the cache. *)
-    if not (!lowMemoryMode ()) then begin
+    if !lowMemoryMode () then
+      (* In low-memory mode, skip loading the fingerprint cache into memory.
+         At scale (e.g. 2M files) the cache can consume >1 GB of RAM.
+         Cache misses will cause re-fingerprinting from disk, but this is
+         rare in steady-state (dataClearlyUnchanged handles most files). *)
+      debug (fun () -> Util.msg "low-memory mode: skipping cache load for %s\n"
+                         (System.fspathToDebugString fspath))
+    else begin
       begin try
         debug (fun () -> Util.msg "opening cache file %s for input\n"
                            (System.fspathToDebugString fspath));
@@ -189,8 +208,7 @@ let init fastCheck ignorearchives fspath =
         debug (fun () -> Util.msg "could not open cache file %s: %s\n"
                            (System.fspathToDebugString fspath) error)
       end
-    end else
-      debug (fun () -> Util.msg "Low-memory mode: skipping cache file loading\n");
+    end;
     let open_cache_file () =
       try
         debug (fun () -> Util.msg "opening cache file %s for output\n"
@@ -243,21 +261,32 @@ let excelFile path =
   || Util.endswith s ".mpp"
 
 let dataClearlyUnchanged fastCheck path info desc stamp =
-  fastCheck
-    &&
-  Props.same_time info.Fileinfo.desc desc
-    &&
-  Props.length info.Fileinfo.desc = Props.length desc
-    &&
-  not (excelFile path)
-    &&
-  match stamp with
-    Fileinfo.InodeStamp inode ->
-      info.Fileinfo.inode = inode
-  | Fileinfo.NoStamp ->
-      true
-  | Fileinfo.RescanStamp ->
-      false
+  if not fastCheck then begin
+    !dataClearlyUnchanged_fail_reason.(0) <- !dataClearlyUnchanged_fail_reason.(0) + 1;
+    false
+  end else if not (Props.same_time info.Fileinfo.desc desc) then begin
+    !dataClearlyUnchanged_fail_reason.(1) <- !dataClearlyUnchanged_fail_reason.(1) + 1;
+    false
+  end else if Props.length info.Fileinfo.desc <> Props.length desc then begin
+    !dataClearlyUnchanged_fail_reason.(2) <- !dataClearlyUnchanged_fail_reason.(2) + 1;
+    false
+  end else if excelFile path then begin
+    !dataClearlyUnchanged_fail_reason.(3) <- !dataClearlyUnchanged_fail_reason.(3) + 1;
+    false
+  end else
+    match stamp with
+    | Fileinfo.InodeStamp inode ->
+        if info.Fileinfo.inode = inode then begin
+          incr dataClearlyUnchanged_ok; true
+        end else begin
+          !dataClearlyUnchanged_fail_reason.(4) <- !dataClearlyUnchanged_fail_reason.(4) + 1;
+          false
+        end
+    | Fileinfo.NoStamp ->
+        incr dataClearlyUnchanged_ok; true
+    | Fileinfo.RescanStamp ->
+        !dataClearlyUnchanged_fail_reason.(4) <- !dataClearlyUnchanged_fail_reason.(4) + 1;
+        false
 
 let ressClearlyUnchanged fastCheck info ress dataClearlyUnchanged =
   fastCheck
@@ -316,12 +345,14 @@ let fingerprint ?(newfile=false) fastCheck currfspath path info optFp =
         raise Not_found;
       debug (fun () -> Util.msg "cache hit for path %s\n"
                          (Path.toDebugString path));
+      incr fp_hits;
       (info.Fileinfo.desc, cachedFp, Fileinfo.stamp info,
        Fileinfo.ressStamp info)
     with Not_found ->
       if fastCheck then
         debug (fun () -> Util.msg "cache miss for path %s\n"
                            (Path.toDebugString path));
+      incr fp_misses;
       let (info, dig) =
         if Prefs.read fastercheckUNSAFE && newfile then begin
           debug (fun()-> Util.msg "skipping initial fingerprint of %s\n"

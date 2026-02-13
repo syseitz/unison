@@ -104,3 +104,7 @@ val archiveHash : Fspath.t -> string
 
 (* Low-memory mode preference *)
 val lowmemory : bool Prefs.t
+
+(* Check whether archive files exist for all roots.
+   Must be called AFTER connectRoots/storeRootsName. *)
+val checkArchivesExist : unit -> bool

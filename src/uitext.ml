@@ -1475,11 +1475,108 @@ let synchronizePathsFromFilesystemWatcher fullintv =
 
 (* ----------------- Repetition ---------------- *)
 
+(* Collect paths for batched initial sync. Directories with more than
+   [threshold] direct children (in either replica) are recursively expanded
+   into their sub-children, up to [maxDepth] levels deep. This ensures no
+   single batch item covers too many files.
+   Internally works with Name.t lists to avoid Path phantom type conflicts
+   (Os.childrenOf needs Path.local, Globals.paths needs Path.t). *)
+let collectBatchPaths () =
+  let threshold = 500000 in
+  let maxDepth = 10 in
+  match Globals.roots () with
+  | (Common.Local, fspath1), (Common.Local, fspath2) ->
+      let children_at names =
+        let path = List.fold_left Path.child Path.empty names in
+        let c1 = try Os.childrenOf fspath1 path with _ -> [] in
+        let c2 = try Os.childrenOf fspath2 path with _ -> [] in
+        let module NSet = Set.Make(Name) in
+        let all = List.fold_left (fun s n -> NSet.add n s) NSet.empty c1 in
+        let all = List.fold_left (fun s n -> NSet.add n s) all c2 in
+        NSet.elements all
+      in
+      let rec expand depth names =
+        if depth >= maxDepth then [names]
+        else
+          let children = children_at names in
+          let nChildren = List.length children in
+          if nChildren > threshold then begin
+            Trace.log (Printf.sprintf
+              "Lowmemory batched sync: expanding %s (%d entries, depth %d)\n"
+              (String.concat "/" (List.map Name.toString names))
+              nChildren depth);
+            List.flatten (List.map (fun name ->
+              expand (depth + 1) (names @ [name])
+            ) children)
+          end else
+            [names]
+      in
+      let topChildren = children_at [] in
+      if topChildren = [] then []
+      else
+        let namesList = List.flatten (List.map (fun n ->
+          expand 1 [n]
+        ) topChildren) in
+        List.map (fun names ->
+          List.fold_left Path.child Path.empty names
+        ) namesList
+  | _ -> []
+
+(* Split a list into chunks of at most n elements *)
+let rec list_chunks n = function
+  | [] -> []
+  | l ->
+      let rec take acc k = function
+        | [] -> (List.rev acc, [])
+        | remaining when k = 0 -> (List.rev acc, remaining)
+        | x :: rest -> take (x :: acc) (k - 1) rest
+      in
+      let (chunk, rest) = take [] n l in
+      chunk :: list_chunks n rest
+
+(* Batched initial sync for lowmemory mode: collect paths (with large
+   directories expanded), split into batches, and run the full sync
+   pipeline for each batch separately, freeing memory between batches. *)
+let synchronizeOnceLowmemoryBatched () =
+  Uicommon.connectRoots ~displayWaitMessage ();
+  let allPaths = collectBatchPaths () in
+  if allPaths = [] then
+    synchronizeOnce None
+  else begin
+    let batchSize = 10 in
+    let batches = list_chunks batchSize allPaths in
+    let savedPaths = Prefs.read Globals.paths in
+    let exitStatus = ref Uicommon.perfectExit in
+    let allFailedPaths = ref [] in
+    let nBatches = List.length batches in
+    List.iteri (fun i batch ->
+      Trace.status (Printf.sprintf
+        "Lowmemory initial sync: batch %d/%d (%d paths)"
+        (i + 1) nBatches (List.length batch));
+      Prefs.set Globals.paths batch;
+      let (status, failures) = synchronizeOnce None in
+      if status <> Uicommon.perfectExit then
+        exitStatus := status;
+      allFailedPaths := !allFailedPaths @ failures;
+      Gc.compact ()
+    ) batches;
+    Prefs.set Globals.paths savedPaths;
+    (!exitStatus, !allFailedPaths)
+  end
+
 let synchronizeUntilNoFailures repeatMode =
   let wantWatcher = repeatMode in
   let rec loop triesLeft pathsOpt =
     let (exitStatus, failedPaths) =
-      synchronizeOnce ~wantWatcher pathsOpt in
+      if Prefs.read Update.lowmemory
+         && pathsOpt = None
+         && Prefs.read Globals.paths = [Path.empty]
+         && not (Update.checkArchivesExist ())
+      then
+        synchronizeOnceLowmemoryBatched ()
+      else
+        synchronizeOnce ~wantWatcher pathsOpt
+    in
     if failedPaths <> [] && triesLeft <> 0
          && not (repeatMode && safeStopRequested ()) then begin
       loop (triesLeft - 1) (Some (failedPaths, []))

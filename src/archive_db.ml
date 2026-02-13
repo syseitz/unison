@@ -42,10 +42,10 @@ let open_db path =
   check_rc db (Sqlite3.exec db "PRAGMA journal_mode=WAL");
   (* Synchronous NORMAL is safe with WAL *)
   check_rc db (Sqlite3.exec db "PRAGMA synchronous=NORMAL");
-  (* Memory-map the database file for faster reads *)
-  check_rc db (Sqlite3.exec db "PRAGMA mmap_size=268435456");
-  (* Increase page cache to 10MB *)
-  check_rc db (Sqlite3.exec db "PRAGMA cache_size=-10000");
+  (* Disable memory-mapping: on macOS the mmap region inflates RSS *)
+  check_rc db (Sqlite3.exec db "PRAGMA mmap_size=0");
+  (* Page cache: 2MB is sufficient for sequential directory lookups *)
+  check_rc db (Sqlite3.exec db "PRAGMA cache_size=-2000");
   (* Create tables *)
   check_rc db (Sqlite3.exec db
     "CREATE TABLE IF NOT EXISTS dirs (
@@ -156,9 +156,9 @@ let load_meta t key =
        | _ -> None)
   | _ -> None
 
-let load_all t =
+(* Iterate over all directory entries without building an intermediate list *)
+let iter_all t f =
   let stmt = Sqlite3.prepare t.db "SELECT path, data FROM dirs" in
-  let results = ref [] in
   let continue = ref true in
   while !continue do
     match Sqlite3.step stmt with
@@ -169,11 +169,10 @@ let load_all t =
         let data = match Sqlite3.column stmt 1 with
           | Sqlite3.Data.BLOB s -> s
           | _ -> "" in
-        results := (path, data) :: !results
+        f path data
     | _ -> continue := false
   done;
-  ignore (Sqlite3.finalize stmt);
-  !results
+  ignore (Sqlite3.finalize stmt)
 
 let is_valid path =
   try
