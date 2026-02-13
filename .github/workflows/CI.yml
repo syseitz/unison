@@ -1117,7 +1117,7 @@ jobs:
         opam-depext: false
 
     - name: Install SQLite3 OCaml bindings
-      if: ${{ !contains(matrix.job.ocaml-version, '4.08') }}
+      if: ${{ !contains(matrix.job.ocaml-version, '4.08') && !contains(matrix.job.ocaml-version, '-musl') }}
       run: sudo apt-get install -y libsqlite3-dev && opam install sqlite3 -y
 
     - name: Build text UI
