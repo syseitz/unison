@@ -4,6 +4,15 @@ abort.cmo : \
     ubase/trace.cmi \
     ubase/prefs.cmi \
     abort.cmi
+archive_db.cmi :
+archive_db.cmo : \
+    archive_db.cmi \
+    ubase/util.cmi \
+    ubase/trace.cmi
+archive_db.cmx : \
+    archive_db.cmi \
+    ubase/util.cmx \
+    ubase/trace.cmx
 abort.cmx : \
     uutil.cmx \
     ubase/util.cmx \
