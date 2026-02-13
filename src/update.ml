@@ -1493,35 +1493,62 @@ let clearArchiveData thisRoot =
 let loadArchiveLowMemory fspath thisRoot =
   let (sqliteName, _) = sqliteArchiveName fspath in
   let sqlitePath = Util.fileInUnisonDir sqliteName in
-  if Archive_db.is_valid sqlitePath then begin
-    debuglm (fun () -> Util.msg "Loading archive skeleton from SQLite: %s\n"
-      sqlitePath);
-    let db = Archive_db.open_db sqlitePath in
-    (* Load just the root entry *)
-    let skeleton =
-      match Archive_db.load db "" with
-      | Some data ->
-          let (desc, _children) = deserialize_dir_children data in
-          ArchiveDir (desc, NameMap.empty)
-      | None -> NoArchive
-    in
-    (* Load metadata *)
-    let hash = match Archive_db.load_meta db "hash" with
-      | Some s -> (try int_of_string s with _ -> 0) | None -> 0 in
-    let magic = match Archive_db.load_meta db "magic" with
-      | Some s -> s | None -> "" in
-    (* Load properties from the DB *)
-    let properties =
-      match Archive_db.load_meta db "properties" with
-      | Some s ->
-          (try Umarshal.from_string Proplist.m s 0
-           with _ -> Proplist.empty)
-      | None -> Proplist.empty
-    in
-    Archive_db.close_db db;
-    Some (skeleton, hash, magic, properties)
-  end else
-    None
+  (* Reuse existing DB handle if available (avoids BUSY errors from
+     concurrent connections when a transaction is still open).
+     Skip is_valid check when reusing - the handle is already known good. *)
+  match get_db_handle thisRoot with
+  | Some db ->
+      debuglm (fun () -> Util.msg
+        "loadArchiveLowMemory: reusing existing DB handle\n");
+      (* Commit any open transaction so data is visible for reads *)
+      (try Archive_db.commit_transaction db with _ -> ());
+      Archive_db.reset_stmts db;
+      let skeleton =
+        match Archive_db.load db "" with
+        | Some data ->
+            let (desc, _children) = deserialize_dir_children data in
+            ArchiveDir (desc, NameMap.empty)
+        | None -> NoArchive
+      in
+      let hash = match Archive_db.load_meta db "hash" with
+        | Some s -> (try int_of_string s with _ -> 0) | None -> 0 in
+      let magic = match Archive_db.load_meta db "magic" with
+        | Some s -> s | None -> "" in
+      let properties =
+        match Archive_db.load_meta db "properties" with
+        | Some s ->
+            (try Umarshal.from_string Proplist.m s 0
+             with _ -> Proplist.empty)
+        | None -> Proplist.empty
+      in
+      Some (skeleton, hash, magic, properties)
+  | None ->
+      if Archive_db.is_valid sqlitePath then begin
+        debuglm (fun () -> Util.msg "Loading archive skeleton from SQLite: %s\n"
+          sqlitePath);
+        let db = Archive_db.open_db sqlitePath in
+        let skeleton =
+          match Archive_db.load db "" with
+          | Some data ->
+              let (desc, _children) = deserialize_dir_children data in
+              ArchiveDir (desc, NameMap.empty)
+          | None -> NoArchive
+        in
+        let hash = match Archive_db.load_meta db "hash" with
+          | Some s -> (try int_of_string s with _ -> 0) | None -> 0 in
+        let magic = match Archive_db.load_meta db "magic" with
+          | Some s -> s | None -> "" in
+        let properties =
+          match Archive_db.load_meta db "properties" with
+          | Some s ->
+              (try Umarshal.from_string Proplist.m s 0
+               with _ -> Proplist.empty)
+          | None -> Proplist.empty
+        in
+        Archive_db.close_db db;
+        Some (skeleton, hash, magic, properties)
+      end else
+        None
 
 (* Migrate a traditional archive to SQLite format *)
 let migrateToSqlite fspath thisRoot archive hash magic properties =
@@ -1564,12 +1591,32 @@ let loadArchiveOnRoot: Common.root -> bool -> (int * string) option Lwt.t =
          clearArchiveData thisRoot
        end else if Prefs.read lowmemory then begin
          (* Low-memory mode: try SQLite first, then migrate *)
-         match loadArchiveLowMemory fspath thisRoot with
-         | Some archData ->
+         let sqliteData = loadArchiveLowMemory fspath thisRoot in
+         (* Check if SQLite archive is stale (traditional archive was updated
+            while running in normal mode). Detect by comparing mtimes. *)
+         let sqliteStale = match sqliteData with
+           | Some _ ->
+               System.file_exists arcFspath &&
+               (try
+                 let (sqliteName, _) = sqliteArchiveName fspath in
+                 let sqlitePath = Util.fileInUnisonDir sqliteName in
+                 let ar_mtime =
+                   (Unix.LargeFile.stat arcFspath).Unix.LargeFile.st_mtime in
+                 let sq_mtime =
+                   (Unix.LargeFile.stat sqlitePath).Unix.LargeFile.st_mtime in
+                 ar_mtime > sq_mtime
+               with Unix.Unix_error _ -> false)
+           | None -> false
+         in
+         match sqliteData with
+         | Some archData when not sqliteStale ->
              log_memory "loadArchive_fromSQLite";
              setArchiveData thisRoot fspath archData None
-         | None ->
-             (* No SQLite archive; try to load traditional and migrate *)
+         | _ ->
+             (* SQLite stale or missing; try to load traditional and migrate *)
+             if sqliteStale then
+               debuglm (fun () -> Util.msg
+                 "Traditional archive newer than SQLite, re-migrating\n");
              begin match loadArchiveLocal arcFspath thisRoot with
              | Some (archive, hash, magic, properties) ->
                  debuglm (fun () ->
@@ -3709,13 +3756,16 @@ let prepareCommitLocal compatMode (fspath, magic) =
             archiveHash
           end
         in
-        (* Write minimal marker file for commit/rename protocol *)
+        (* Write full archive file (streaming from DB) for commit/rename
+           protocol. Using the full format (not a marker) ensures that the
+           .ar file is always readable by loadArchiveLocal, which is needed
+           when switching from lowmemory to normal mode. *)
         let scratchPath = Util.fileInUnisonDir newName in
         let props = getArchiveProps root in
         let paths =
           try Proplist.find propPathKey props with Not_found -> PathMap.empty in
         let properties = Proplist.remove propPathKey props in
-        Util.convertUnixErrorsToFatal "saving marker archive" (fun () ->
+        Util.convertUnixErrorsToFatal "saving archive" (fun () ->
           let c =
             System.open_out_gen
               [Open_wronly; Open_creat; Open_trunc; Open_binary] 0o600
@@ -3739,6 +3789,8 @@ let prepareCommitLocal compatMode (fspath, magic) =
           let header = Bytes.create Umarshal.header_size in
           let header_pos = pos_out c in
           output c header 0 Umarshal.header_size;
+          Archive_db.reset_stmts db;
+          write_archive_streaming db Path.empty (output c);
           Umarshal.write_to Umarshal.int (output c) archiveHash;
           Umarshal.write_to Umarshal.string (output c) magic;
           Umarshal.write_to Proplist.m (output c) properties;

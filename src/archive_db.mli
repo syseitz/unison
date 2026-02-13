@@ -6,6 +6,7 @@
 type t
 
 val open_db : string -> t
+val reset_stmts : t -> unit
 val close_db : t -> unit
 
 (* Directory blob storage: one row per directory path.

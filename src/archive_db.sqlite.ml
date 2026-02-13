@@ -76,6 +76,14 @@ let open_db path =
   { db; stmt_load; stmt_store; stmt_delete; stmt_delete_sub;
     stmt_meta_load; stmt_meta_store }
 
+let reset_stmts t =
+  ignore (Sqlite3.reset t.stmt_load);
+  ignore (Sqlite3.reset t.stmt_store);
+  ignore (Sqlite3.reset t.stmt_delete);
+  ignore (Sqlite3.reset t.stmt_delete_sub);
+  ignore (Sqlite3.reset t.stmt_meta_load);
+  ignore (Sqlite3.reset t.stmt_meta_store)
+
 let close_db t =
   debug (fun () -> Util.msg "Closing archive database\n");
   ignore (Sqlite3.finalize t.stmt_load);
@@ -132,6 +140,10 @@ let delete_subtree t path =
   check_rc t.db (Sqlite3.step stmt)
 
 let begin_transaction t =
+  (* Ensure no stale transaction is active before starting a new one.
+     Commit any previous transaction first (ignore errors if none active). *)
+  (try ignore (Sqlite3.exec t.db "COMMIT") with _ -> ());
+  reset_stmts t;
   check_rc t.db (Sqlite3.exec t.db "BEGIN IMMEDIATE")
 
 let commit_transaction t =

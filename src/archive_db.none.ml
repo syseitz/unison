@@ -10,6 +10,7 @@ let no_sqlite3 () =
      compiled in. Please install the sqlite3-ocaml package and rebuild Unison.")
 
 let open_db _ = no_sqlite3 ()
+let reset_stmts _ = ()
 let close_db _ = ()
 
 let load _ _ = no_sqlite3 ()
