@@ -45,6 +45,7 @@ ubase/projectInfo.ml: Makefile.ProjectInfo
 
 clean::
 	cd ubase && $(RM) projectInfo.ml
+	$(RM) archive_db.ml
 
 ####################################################################
 ### Unison objects and libraries

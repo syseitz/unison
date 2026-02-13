@@ -95,7 +95,11 @@ let has_sqlite3 =
   let found =
     match ocamlfind with
     | Some cmd -> shell ~err_null:true (cmd ^ " query sqlite3") |> not_empty
-    | None -> exists ocaml_libdir "sqlite3"
+    | None ->
+        exists ocaml_libdir "sqlite3" ||
+        (* Check opam switch library directory *)
+        let prefix = env.$("OPAM_SWITCH_PREFIX") in
+        not_empty prefix && exists (prefix ^ "/lib") "sqlite3"
   in
   if not found then
     info "SQLite3 library not found. Low-memory mode will not be available."
@@ -104,14 +108,32 @@ let has_sqlite3 =
   found
 
 let () =
+  (* Select the right archive_db implementation based on sqlite3 availability *)
+  let src_file =
+    if has_sqlite3 then "archive_db.sqlite.ml"
+    else "archive_db.none.ml"
+  in
+  let copy_file src dst =
+    let ic = open_in src in
+    let oc = open_out dst in
+    (try while true do output_char oc (input_char ic) done
+     with End_of_file -> ());
+    close_in ic; close_out oc
+  in
+  copy_file src_file "archive_db.ml";
   if has_sqlite3 then begin
-    "CAMLFLAGS" <-+= "-DHAS_SQLITE3";
     (match ocamlfind with
      | Some cmd ->
          "CAMLFLAGS_SQLITE3" <-- shell (cmd ^ " query -format \"-I \"\"%d\"\"\" sqlite3");
          "OCAMLLIBS_SQLITE3" <-- "sqlite3.cma"
      | None ->
-         "CAMLFLAGS_SQLITE3" <-- "-I +sqlite3";
+         let prefix = env.$("OPAM_SWITCH_PREFIX") in
+         let sqlite3_dir =
+           if not_empty prefix && exists (prefix ^ "/lib") "sqlite3"
+           then prefix ^ "/lib/sqlite3"
+           else ocaml_libdir ^ "/sqlite3"
+         in
+         "CAMLFLAGS_SQLITE3" <-- "-I " ^ sqlite3_dir;
          "OCAMLLIBS_SQLITE3" <-- "sqlite3.cma");
     "CAMLFLAGS" <-+= ($)"CAMLFLAGS_SQLITE3";
     "OCAMLLIBS" <-+= ($)"OCAMLLIBS_SQLITE3";

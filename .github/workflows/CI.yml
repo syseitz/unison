@@ -19,7 +19,11 @@ jobs:
       with:
         ocaml-compiler: 4.14.x
 
-    - run: sudo apt-get install hevea lynx texlive-latex-base
+    - run: sudo apt-get install hevea lynx texlive-latex-base libsqlite3-dev
+
+    - run: opam install sqlite3
+      env:
+        OPAMYES: true
 
     - run: opam exec -- make -j 2 docs
 
@@ -147,6 +151,19 @@ jobs:
       shell: cmd
       run: |
         echo SHELLOPTS=igncr>> %GITHUB_ENV%
+
+    - name: Install SQLite3 OCaml bindings
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        if [ "${{ runner.os }}" = "Linux" ]; then
+          if [[ "${{ matrix.job.ocaml-version }}" == *"32bit"* ]]; then
+            sudo apt-get install -y libsqlite3-dev:i386
+          else
+            sudo apt-get install -y libsqlite3-dev
+          fi
+        fi
+        opam install sqlite3 -y
 
     - run: |
         opam exec -- ${{ env._MAKE }} tui fsmonitor
@@ -653,6 +670,15 @@ jobs:
         echo %CYGWIN_ROOT_WRAPPERBIN%>> %GITHUB_PATH%
         echo SHELLOPTS=igncr>> %GITHUB_ENV%
 
+    - name: Install SQLite3 OCaml bindings
+      if: runner.os != 'Windows' && !contains(matrix.job.ocaml-version, '4.08')
+      shell: bash
+      run: |
+        if [ "${{ runner.os }}" = "Linux" ]; then
+          sudo apt-get install -y libsqlite3-dev
+        fi
+        opam install sqlite3 -y
+
     - name: Checkout HEAD to _new
       uses: actions/checkout@v4
       with:
@@ -1022,6 +1048,12 @@ jobs:
 
     - run: opam install . --deps-only
 
+    - name: Install SQLite3 OCaml bindings
+      if: contains(matrix.job.os, 'ubuntu')
+      run: sudo apt-get install -y libsqlite3-dev
+
+    - run: opam install sqlite3 -y
+
     - run: opam exec -- dune build && cp -L ./_build/install/default/bin/unison* ./src/
 
 #    - run: opam exec -- make test
@@ -1047,6 +1079,8 @@ jobs:
       with:
         ocaml-compiler: "${{ matrix.job.ocaml-compiler }}"
         opam-pin: false
+
+    - run: sudo apt-get install -y libsqlite3-dev && opam install sqlite3 -y
 
     - run: opam exec -- make tui NATIVE=false
 
@@ -1081,6 +1115,10 @@ jobs:
         opam-disable-sandboxing: true
         opam-pin: false
         opam-depext: false
+
+    - name: Install SQLite3 OCaml bindings
+      if: ${{ !contains(matrix.job.ocaml-version, '4.08') }}
+      run: sudo apt-get install -y libsqlite3-dev && opam install sqlite3 -y
 
     - name: Build text UI
       env:

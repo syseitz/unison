@@ -29,6 +29,7 @@
 /src/mkProjectInfo
 /src/u-b.o.startup.s
 /src/ubase/projectInfo.ml
+/src/archive_db.ml
 /src/unison
 /src/unison-gui
 /src/unison-fsmonitor

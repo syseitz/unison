@@ -17,7 +17,10 @@
   (language c)
   (names bytearray_stubs osxsupport pty hash_compat props_xattr props_acl copy_stubs))
  (c_library_flags -lutil)
- (libraries compat str unix lwt_lib bigarray sqlite3))
+ (libraries compat str unix lwt_lib bigarray
+  (select archive_db.ml from
+   (sqlite3 -> archive_db.sqlite.ml)
+   (         -> archive_db.none.ml))))
 
 (include_subdirs unqualified)
 
