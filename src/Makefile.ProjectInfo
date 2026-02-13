@@ -1,5 +1,5 @@
 MAJORVERSION=2.53
 
-VERSION=2.53.8
+VERSION=2.53.8+lowmemory
 
 NAME=unison
