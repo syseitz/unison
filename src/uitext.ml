@@ -1521,6 +1521,8 @@ let collectBatchPaths () =
     let all = List.fold_left (fun s n -> NSet.add n s) NSet.empty c1 in
     let all = List.fold_left (fun s n -> NSet.add n s) all c2 in
     NSet.elements all
+    |> List.filter (fun name ->
+         not (Globals.shouldIgnore (Path.child path name)))
   in
   let grandchildTotalAt names =
     let path = List.fold_left Path.child Path.empty names in
