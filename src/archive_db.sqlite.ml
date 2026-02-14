@@ -40,6 +40,8 @@ let check_rc db rc =
 let open_db path =
   debug (fun () -> Util.msg "Opening archive database: %s\n" path);
   let db = Sqlite3.db_open ~mutex:`FULL path in
+  (* Wait up to 5s if another process holds a lock *)
+  ignore (Sqlite3.busy_timeout db 5000);
   (* WAL mode for better read concurrency *)
   check_rc db (Sqlite3.exec db "PRAGMA journal_mode=WAL");
   (* Synchronous NORMAL is safe with WAL *)
