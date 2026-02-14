@@ -1572,7 +1572,7 @@ let synchronizeOnceLowmemoryBatched () =
   if allPaths = [] then
     synchronizeOnce None
   else begin
-    let batchSize = 10 in
+    let batchSize = 1 in
     let batches = list_chunks batchSize allPaths in
     let savedPaths = Prefs.read Globals.paths in
     let exitStatus = ref Uicommon.perfectExit in

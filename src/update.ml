@@ -925,6 +925,7 @@ let clearBatchState () =
   ) archiveCache;
   (* Clear all auxiliary caches *)
   dir_cache_clear ();
+  Hashtbl.clear archivePropCache;
   Hashtbl.clear archiveInfoCache;
   Hashtbl.clear db_modified;
   scan_db := None;
