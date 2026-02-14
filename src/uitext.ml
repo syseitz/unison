@@ -1475,100 +1475,78 @@ let synchronizePathsFromFilesystemWatcher fullintv =
 
 (* ----------------- Repetition ---------------- *)
 
-let childrenOfOnRoot : Common.root -> Path.local -> Name.t list Lwt.t =
-  Remote.registerRootCmd "childrenOf"
+(* Batch RPC: for each child of path, return (name, nGrandchildren).
+   One RPC per root replaces N individual childrenOf + grandchildTotal RPCs. *)
+let expandInfoOnRoot : Common.root -> Path.local -> (Name.t * int) list Lwt.t =
+  Remote.registerRootCmd "expandInfo"
     Path.mlocal
-    Umarshal.(list Name.m)
-    (fun (fspath, path) ->
-       Lwt.return (try Os.childrenOf fspath path with _ -> []))
-
-let grandchildTotalOnRoot : Common.root -> Path.local -> int Lwt.t =
-  Remote.registerRootCmd "grandchildTotal"
-    Path.mlocal
-    Umarshal.int
+    Umarshal.(list (prod2 Name.m int id id))
     (fun (fspath, path) ->
        let children = try Os.childrenOf fspath path with _ -> [] in
-       Lwt.return (List.fold_left (fun acc name ->
-         acc + List.length
-           (try Os.childrenOf fspath (Path.child path name) with _ -> [])
-       ) 0 children))
+       Lwt.return (List.map (fun name ->
+         let n = List.length
+           (try Os.childrenOf fspath (Path.child path name) with _ -> []) in
+         (name, n)
+       ) children))
 
-(* Collect paths for batched initial sync. Directories are recursively
-   expanded based on depth-aware heuristics to ensure no single batch item
-   covers too many files:
+(* Collect paths for batched initial sync. Uses expandInfoOnRoot to gather
+   all children + their child counts in a single RPC per root per directory
+   level (instead of per-child RPCs). Expansion heuristics:
    - >maxExpand direct children: flat dir (e.g. 89k .bed files) — stop
-   - >expandThreshold direct children: many subdirs — expand
-   - ≤expandThreshold direct children: check grandchild total to detect
-     deeply nested trees (e.g. data/ with only 22 top-level entries but
-     millions of files below)
-   Internally works with Name.t lists to avoid Path phantom type conflicts
-   (Os.childrenOf needs Path.local, Globals.paths needs Path.t).
-   Uses childrenOfOnRoot/grandchildTotalOnRoot to transparently support
-   local and remote roots. *)
+   - >expandThreshold direct children or grandchild total: expand
+   - Pre-filters: children with 0 or >maxExpand grandchildren are kept
+     as leaves without recursion, saving further RPCs. *)
 let collectBatchPaths () =
   let maxExpand = 10000 in
   let expandThreshold = 100 in
   let maxDepth = 10 in
   let (root1, root2) = Globals.roots () in
-  let childrenAt names =
+  let expandInfoAt names =
     let path = List.fold_left Path.child Path.empty names in
-    let (c1, c2) = Lwt_unix.run (
-      childrenOfOnRoot root1 path >>= fun c1 ->
-      childrenOfOnRoot root2 path >>= fun c2 ->
-      Lwt.return (c1, c2)
+    let (info1, info2) = Lwt_unix.run (
+      expandInfoOnRoot root1 path >>= fun i1 ->
+      expandInfoOnRoot root2 path >>= fun i2 ->
+      Lwt.return (i1, i2)
     ) in
-    let module NSet = Set.Make(Name) in
-    let all = List.fold_left (fun s n -> NSet.add n s) NSet.empty c1 in
-    let all = List.fold_left (fun s n -> NSet.add n s) all c2 in
-    NSet.elements all
-    |> List.filter (fun name ->
+    let module NMap = Map.Make(Name) in
+    let m = List.fold_left (fun m (name, n) ->
+      NMap.add name n m) NMap.empty info1 in
+    let m = List.fold_left (fun m (name, n) ->
+      let existing = try NMap.find name m with Not_found -> 0 in
+      NMap.add name (max existing n) m) m info2 in
+    NMap.bindings m
+    |> List.filter (fun (name, _) ->
          not (Globals.shouldIgnore (Path.child path name)))
   in
-  let grandchildTotalAt names =
-    let path = List.fold_left Path.child Path.empty names in
-    let (g1, g2) = Lwt_unix.run (
-      grandchildTotalOnRoot root1 path >>= fun g1 ->
-      grandchildTotalOnRoot root2 path >>= fun g2 ->
-      Lwt.return (g1, g2)
-    ) in
-    max g1 g2
-  in
-  let rec expandInto depth children names =
-    List.flatten (List.map (fun name ->
-      expand (depth + 1) (names @ [name])
-    ) children)
-  and expand depth names =
+  let rec expand depth names =
     if depth >= maxDepth then [names]
     else
-      let children = childrenAt names in
-      let nChildren = List.length children in
+      let info = expandInfoAt names in
+      let nChildren = List.length info in
       if nChildren = 0 then [names]
-      else if nChildren > maxExpand then
-        [names]
-      else if nChildren > expandThreshold then begin
-        Trace.log (Printf.sprintf
-          "Lowmemory batched sync: expanding %s (%d entries, depth %d)\n"
-          (String.concat "/" (List.map Name.toString names))
-          nChildren depth);
-        expandInto depth children names
-      end else begin
-        let gcTotal = grandchildTotalAt names in
-        if gcTotal > expandThreshold then begin
+      else if nChildren > maxExpand then [names]
+      else
+        let gcTotal = List.fold_left (fun acc (_, n) -> acc + n) 0 info in
+        if nChildren > expandThreshold || gcTotal > expandThreshold then begin
           Trace.log (Printf.sprintf
-            "Lowmemory batched sync: expanding %s (grandchild total %d, depth %d)\n"
+            "Lowmemory batched sync: expanding %s (%d entries, gc total %d, depth %d)\n"
             (String.concat "/" (List.map Name.toString names))
-            gcTotal depth);
-          expandInto depth children names
+            nChildren gcTotal depth);
+          List.flatten (List.map (fun (name, nGc) ->
+            if nGc = 0 || nGc > maxExpand then
+              [names @ [name]]
+            else
+              expand (depth + 1) (names @ [name])
+          ) info)
         end else
           [names]
-      end
   in
-  let topChildren = childrenAt [] in
-  if topChildren = [] then []
+  let topInfo = expandInfoAt [] in
+  if topInfo = [] then []
   else
-    let namesList = List.flatten (List.map (fun n ->
+    let namesList = List.flatten (List.map (fun (n, _) ->
       expand 1 [n]
-    ) topChildren) in
+    ) topInfo) in
     List.map (fun names ->
       List.fold_left Path.child Path.empty names
     ) namesList
