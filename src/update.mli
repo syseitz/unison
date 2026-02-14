@@ -108,3 +108,7 @@ val lowmemory : bool Prefs.t
 (* Check whether archive files exist for all roots.
    Must be called AFTER connectRoots/storeRootsName. *)
 val checkArchivesExist : unit -> bool
+
+(* Clear in-memory caches between lowmemory batches to free memory.
+   Replaces archives with skeletons and clears auxiliary caches. *)
+val clearBatchState : unit -> unit

@@ -1609,6 +1609,7 @@ let synchronizeOnceLowmemoryBatched () =
       if status <> Uicommon.perfectExit then
         exitStatus := status;
       allFailedPaths := !allFailedPaths @ failures;
+      Update.clearBatchState ();
       Gc.compact ()
     ) batches;
     Prefs.set Globals.paths savedPaths;

@@ -912,6 +912,24 @@ let dir_cache_clear () =
   Hashtbl.reset dir_cache;
   dir_cache_dirty_count := 0
 
+(* Reset all in-memory caches between lowmemory batches.
+   Archives are replaced with skeletons (keeping root Props but clearing
+   children), and all auxiliary caches are cleared. DB handles are kept
+   open. Call this AFTER synchronizeOnce returns (archives committed). *)
+let clearBatchState () =
+  (* Replace archives with skeletons to free child trees *)
+  Hashtbl.filter_map_inplace (fun _root archive ->
+    match archive with
+    | ArchiveDir (desc, _) -> Some (ArchiveDir (desc, NameMap.empty))
+    | other -> Some other
+  ) archiveCache;
+  (* Clear all auxiliary caches *)
+  dir_cache_clear ();
+  Hashtbl.clear archiveInfoCache;
+  Hashtbl.clear db_modified;
+  scan_db := None;
+  scan_root := ""
+
 (* Evict cache entries using LRU strategy. Clean entries are evicted
    first (free to discard), then dirty entries (flushed to DB). *)
 let dir_cache_evict () =
