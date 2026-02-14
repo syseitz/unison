@@ -912,6 +912,8 @@ let dir_cache_clear () =
   Hashtbl.reset dir_cache;
   dir_cache_dirty_count := 0
 
+external malloc_release : unit -> unit = "caml_malloc_release"
+
 (* Reset all in-memory caches between lowmemory batches.
    Archives are replaced with skeletons (keeping root Props but clearing
    children), and all auxiliary caches are cleared. DB handles are kept
@@ -929,7 +931,9 @@ let clearBatchState () =
   Hashtbl.clear archiveInfoCache;
   Hashtbl.clear db_modified;
   scan_db := None;
-  scan_root := ""
+  scan_root := "";
+  Gc.compact ();
+  malloc_release ()
 
 (* Evict cache entries using LRU strategy. Clean entries are evicted
    first (free to discard), then dirty entries (flushed to DB). *)

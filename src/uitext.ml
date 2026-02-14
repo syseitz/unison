@@ -1498,7 +1498,7 @@ let expandInfoOnRoot : Common.root -> Path.local -> (Name.t * int) list Lwt.t =
      as leaves without recursion, saving further RPCs. *)
 let collectBatchPaths () =
   let maxExpand = 10000 in
-  let expandThreshold = 100 in
+  let expandThreshold = 30 in
   let maxDepth = 10 in
   let (root1, root2) = Globals.roots () in
   let expandInfoAt names =
@@ -1587,8 +1587,7 @@ let synchronizeOnceLowmemoryBatched () =
       if status <> Uicommon.perfectExit then
         exitStatus := status;
       allFailedPaths := !allFailedPaths @ failures;
-      Update.clearBatchState ();
-      Gc.compact ()
+      Update.clearBatchState ()
     ) batches;
     Prefs.set Globals.paths savedPaths;
     (!exitStatus, !allFailedPaths)
