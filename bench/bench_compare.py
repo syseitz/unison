@@ -27,6 +27,7 @@ Exit codes:
   1 = build or runtime error
 """
 import os
+import platform
 import subprocess
 import time
 import shutil
@@ -43,6 +44,8 @@ parser.add_argument("--no-cache", action="store_true",
                     help="Force fresh normal-mode measurement (ignore cache)")
 parser.add_argument("--lowmemory-only", action="store_true",
                     help="Only run lowmemory mode, load normal results from cache")
+parser.add_argument("--json-output", metavar="FILE",
+                    help="Save results as JSON to FILE (for chart generation)")
 args = parser.parse_args()
 
 NUM_FILES = args.num_files
@@ -253,24 +256,45 @@ def delete_files(src_dir: str, count: int) -> int:
 
 # --------------- Benchmark ---------------
 
+IS_LINUX = platform.system() == "Linux"
+
+
+def _time_cmd() -> list:
+    """Return the platform-specific time command prefix."""
+    if IS_LINUX:
+        return ["/usr/bin/time", "-v"]
+    return ["/usr/bin/time", "-l"]
+
+
 def parse_time_output(stderr_text: str) -> dict:
-    """Parse macOS /usr/bin/time -l output."""
+    """Parse /usr/bin/time output (macOS -l or Linux -v)."""
     result = {}
     for line in stderr_text.split("\n"):
         line = line.strip()
+        # macOS: "N.NN real"
         m = re.search(r"([\d.]+)\s+real", line)
         if m:
             result["wall_s"] = float(m.group(1))
-        if "maximum resident set size" in line:
+        # Linux GNU time: "Elapsed (wall clock) time (h:mm:ss or m:ss): 0:01.23"
+        m = re.search(r"wall clock.*?(\d+):(\d+\.\d+)", line)
+        if m:
+            result["wall_s"] = int(m.group(1)) * 60 + float(m.group(2))
+        m = re.search(r"wall clock.*?(\d+):(\d+):(\d+\.\d+)", line)
+        if m:
+            result["wall_s"] = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+        # macOS: "NNNNN maximum resident set size" (bytes)
+        if "maximum resident set size" in line.lower():
             m2 = re.search(r"(\d+)", line)
             if m2:
-                result["rss_bytes"] = int(m2.group(1))
+                val = int(m2.group(1))
+                # Linux reports in KB, macOS in bytes
+                result["rss_bytes"] = val * 1024 if IS_LINUX else val
     return result
 
 
 def run_sync(label: str, extra_args: list, env: dict) -> dict:
     """Run a unison sync and return timing/memory stats."""
-    cmd = ["/usr/bin/time", "-l", UNISON, SRC, DST,
+    cmd = _time_cmd() + [UNISON, SRC, DST,
            "-servercmd", UNISON] + COMMON_ARGS + extra_args
 
     t0 = time.time()
@@ -301,6 +325,11 @@ def run_sync(label: str, extra_args: list, env: dict) -> dict:
                 "block output", "messages sent",
                 "messages received", "signals received",
                 "voluntary context",
+                # GNU time (Linux) keywords
+                "Command being timed", "User time", "System time",
+                "Percent of CPU", "Elapsed", "Minor", "Major",
+                "File system", "Socket messages", "Signals delivered",
+                "Page size", "Exit status", "Average",
             ]
             err_lines = [l for l in all_err.split("\n")
                          if not any(x in l for x in time_keywords)]
@@ -479,6 +508,19 @@ def main():
             print(f"  Result: ALL {n_pass} CHECKS PASSED")
 
         print(f"{'='*60}")
+
+        # JSON output for chart generation
+        if args.json_output:
+            json_data = {
+                "num_files": NUM_FILES,
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "platform": platform.system(),
+                "normal": normal_results,
+                "lowmemory": lowmem_results,
+            }
+            with open(args.json_output, "w") as f:
+                json.dump(json_data, f, indent=2)
+            print(f"\n  JSON results saved to {args.json_output}")
 
     finally:
         if os.path.exists(BENCH_DIR):

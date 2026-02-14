@@ -1,0 +1,92 @@
+name: Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      sizes:
+        description: 'File counts to benchmark (comma-separated)'
+        required: false
+        default: '1000,5000,20000,50000'
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'bench/**'
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        num_files: ${{ fromJSON(format('[{0}]', inputs.sizes || '1000,5000,20000,50000')) }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Use OCaml
+      uses: ocaml/setup-ocaml@v3
+      with:
+        ocaml-compiler: 5.4.x
+
+    - name: Install system dependencies
+      run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+    - name: Install OCaml dependencies
+      run: opam install sqlite3 -y
+      env:
+        OPAMYES: true
+
+    - name: Build Unison
+      run: |
+        opam exec -- dune build src/linktext.exe
+        ls -la _build/default/src/linktext.exe
+
+    - name: Run benchmark (${{ matrix.num_files }} files)
+      run: |
+        python3 bench/bench_compare.py \
+          --no-cache \
+          --json-output bench_result_${{ matrix.num_files }}.json \
+          ${{ matrix.num_files }}
+      timeout-minutes: 30
+
+    - name: Upload result
+      uses: actions/upload-artifact@v4
+      with:
+        name: bench-result-${{ matrix.num_files }}
+        path: bench_result_${{ matrix.num_files }}.json
+
+  charts:
+    needs: bench
+    runs-on: ubuntu-24.04
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download all benchmark results
+      uses: actions/download-artifact@v4
+      with:
+        pattern: bench-result-*
+        merge-multiple: true
+
+    - name: Install matplotlib
+      run: pip install matplotlib
+
+    - name: Generate charts
+      run: |
+        ls -la bench_result_*.json
+        python3 bench/generate_charts.py bench_result_*.json -o bench_results
+
+    - name: Upload charts
+      uses: actions/upload-artifact@v4
+      with:
+        name: benchmark-charts
+        path: bench_results/
+
+    - name: Post summary
+      run: |
+        echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        cat bench_results/RESULTS.md >> $GITHUB_STEP_SUMMARY
