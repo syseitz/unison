@@ -1482,15 +1482,32 @@ let childrenOfOnRoot : Common.root -> Path.local -> Name.t list Lwt.t =
     (fun (fspath, path) ->
        Lwt.return (try Os.childrenOf fspath path with _ -> []))
 
-(* Collect paths for batched initial sync. Directories with more than
-   [threshold] direct children (in either replica) are recursively expanded
-   into their sub-children, up to [maxDepth] levels deep. This ensures no
-   single batch item covers too many files.
+let grandchildTotalOnRoot : Common.root -> Path.local -> int Lwt.t =
+  Remote.registerRootCmd "grandchildTotal"
+    Path.mlocal
+    Umarshal.int
+    (fun (fspath, path) ->
+       let children = try Os.childrenOf fspath path with _ -> [] in
+       Lwt.return (List.fold_left (fun acc name ->
+         acc + List.length
+           (try Os.childrenOf fspath (Path.child path name) with _ -> [])
+       ) 0 children))
+
+(* Collect paths for batched initial sync. Directories are recursively
+   expanded based on depth-aware heuristics to ensure no single batch item
+   covers too many files:
+   - >maxExpand direct children: flat dir (e.g. 89k .bed files) — stop
+   - >expandThreshold direct children: many subdirs — expand
+   - ≤expandThreshold direct children: check grandchild total to detect
+     deeply nested trees (e.g. data/ with only 22 top-level entries but
+     millions of files below)
    Internally works with Name.t lists to avoid Path phantom type conflicts
    (Os.childrenOf needs Path.local, Globals.paths needs Path.t).
-   Uses childrenOfOnRoot to transparently support local and remote roots. *)
+   Uses childrenOfOnRoot/grandchildTotalOnRoot to transparently support
+   local and remote roots. *)
 let collectBatchPaths () =
-  let threshold = 500000 in
+  let maxExpand = 10000 in
+  let expandThreshold = 100 in
   let maxDepth = 10 in
   let (root1, root2) = Globals.roots () in
   let childrenAt names =
@@ -1505,21 +1522,44 @@ let collectBatchPaths () =
     let all = List.fold_left (fun s n -> NSet.add n s) all c2 in
     NSet.elements all
   in
-  let rec expand depth names =
+  let grandchildTotalAt names =
+    let path = List.fold_left Path.child Path.empty names in
+    let (g1, g2) = Lwt_unix.run (
+      grandchildTotalOnRoot root1 path >>= fun g1 ->
+      grandchildTotalOnRoot root2 path >>= fun g2 ->
+      Lwt.return (g1, g2)
+    ) in
+    max g1 g2
+  in
+  let rec expandInto depth children names =
+    List.flatten (List.map (fun name ->
+      expand (depth + 1) (names @ [name])
+    ) children)
+  and expand depth names =
     if depth >= maxDepth then [names]
     else
       let children = childrenAt names in
       let nChildren = List.length children in
-      if nChildren > threshold then begin
+      if nChildren = 0 then [names]
+      else if nChildren > maxExpand then
+        [names]
+      else if nChildren > expandThreshold then begin
         Trace.log (Printf.sprintf
           "Lowmemory batched sync: expanding %s (%d entries, depth %d)\n"
           (String.concat "/" (List.map Name.toString names))
           nChildren depth);
-        List.flatten (List.map (fun name ->
-          expand (depth + 1) (names @ [name])
-        ) children)
-      end else
-        [names]
+        expandInto depth children names
+      end else begin
+        let gcTotal = grandchildTotalAt names in
+        if gcTotal > expandThreshold then begin
+          Trace.log (Printf.sprintf
+            "Lowmemory batched sync: expanding %s (grandchild total %d, depth %d)\n"
+            (String.concat "/" (List.map Name.toString names))
+            gcTotal depth);
+          expandInto depth children names
+        end else
+          [names]
+      end
   in
   let topChildren = childrenAt [] in
   if topChildren = [] then []
