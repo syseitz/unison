@@ -60,18 +60,25 @@ let stringSetFromList l =
 type infos = { s : string; clr : string }
 let infos = ref { s = ""; clr = "" }
 
+let flush_stdout () =
+  try flush stdout
+  with Sys_blocked_io ->
+    (* OCaml 5.x: Lwt may leave stdout in non-blocking mode *)
+    Unix.clear_nonblock Unix.stdout;
+    flush stdout
+
 let clear_infos () =
   if !infos.clr <> "" then begin
     print_string !infos.clr;
-    flush stdout
+    flush_stdout ()
   end else if !infos.s <> "" then begin
     print_string "\r";
     print_string (String.make (String.length !infos.s) ' ');
     print_string "\r";
-    flush stdout
+    flush_stdout ()
   end
 let show_infos () =
-  if !infos.s <> "" then begin print_string !infos.s; flush stdout end
+  if !infos.s <> "" then begin print_string !infos.s; flush_stdout () end
 let set_infos ?(clr = "") s =
   if s <> !infos.s then begin clear_infos (); infos := {s; clr}; show_infos () end
 

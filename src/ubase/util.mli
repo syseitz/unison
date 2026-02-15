@@ -129,3 +129,5 @@ val msg : ('a, out_channel, unit) format -> 'a
 (* Set the info line.
    [~clr] is an alternative clear sequence to clear this info only. *)
 val set_infos : ?clr:string -> string -> unit
+(* Flush stdout, handling Sys_blocked_io from OCaml 5.x non-blocking mode *)
+val flush_stdout : unit -> unit

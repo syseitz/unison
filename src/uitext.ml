@@ -156,7 +156,7 @@ let colorDiff text =
 
 let alwaysDisplay message =
   print_string message;
-  flush stdout
+  Util.flush_stdout ()
 
 let alwaysDisplayAndLog message =
 (*  alwaysDisplay message;*)
