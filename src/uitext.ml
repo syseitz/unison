@@ -1569,10 +1569,10 @@ let list_chunks_by_weight maxWeight items =
   in
   go [] [] 0 items
 
-(* Batched initial sync for lowmemory mode: collect paths (with large
+(* Batched sync for lowmemory mode: collect paths (with large
    directories expanded), split into batches by estimated file count,
    and run the full sync pipeline for each batch separately, freeing
-   memory between batches. *)
+   memory between batches. Works for both initial and follow-up syncs. *)
 let synchronizeOnceLowmemoryBatched () =
   Uicommon.connectRoots ~displayWaitMessage ();
   let allPathsWeighted = collectBatchPaths () in
@@ -1587,7 +1587,7 @@ let synchronizeOnceLowmemoryBatched () =
     let nBatches = List.length batches in
     List.iteri (fun i batch ->
       Trace.status (Printf.sprintf
-        "Lowmemory initial sync: batch %d/%d (%d paths)"
+        "Lowmemory batched sync: batch %d/%d (%d paths)"
         (i + 1) nBatches (List.length batch));
       Prefs.set Globals.paths batch;
       let (status, failures) = synchronizeOnce None in
@@ -1607,7 +1607,6 @@ let synchronizeUntilNoFailures repeatMode =
       if Prefs.read Update.lowmemory
          && pathsOpt = None
          && Prefs.read Globals.paths = [Path.empty]
-         && not (Update.checkArchivesExist ())
       then
         synchronizeOnceLowmemoryBatched ()
       else
