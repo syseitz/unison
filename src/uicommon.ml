@@ -25,15 +25,18 @@ open Lwt
 type interface =
    Text
  | Graphic
+ | Jsonrpc
 
 let minterface =
-  Umarshal.(sum2 unit unit
+  Umarshal.(sum3 unit unit unit
               (function
-               | Text -> I21 ()
-               | Graphic -> I22 ())
+               | Text -> I31 ()
+               | Graphic -> I32 ()
+               | Jsonrpc -> I33 ())
               (function
-               | I21 () -> Text
-               | I22 () -> Graphic))
+               | I31 () -> Text
+               | I32 () -> Graphic
+               | I33 () -> Jsonrpc))
 
 module type UI =
 sig

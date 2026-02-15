@@ -131,9 +131,10 @@ let interface =
   Prefs.create uiPrefName Uicommon.Graphic
     ~category:(`Advanced `General)
     ~cli_only:true
-    "select UI ('text' or 'graphic'); command-line only"
+    "select UI ('text', 'graphic' or 'jsonrpc'); command-line only"
     ("This preference selects either the graphical or the textual user "
-     ^ "interface.  Legal values are \\verb|graphic| or \\verb|text|.  "
+     ^ "interface.  Legal values are \\verb|graphic|, \\verb|text|, "
+     ^ "or \\verb|jsonrpc|.  "
      ^ "\n\nBecause this option is processed specially during Unison's "
      ^ "start-up sequence, it can {\\em only} be used on the command line.  "
      ^ "In preference files it has no effect."
@@ -145,13 +146,16 @@ let interface =
     (fun _ -> function
         "text" -> Uicommon.Text
       | "graphic" -> Uicommon.Graphic
+      | "jsonrpc" -> Uicommon.Jsonrpc
       | other ->
           raise (Prefs.IllegalValue ("option ui :\n\
                                       text -> textual user interface\n\
-                                      graphic -> graphic user interface\n"
+                                      graphic -> graphic user interface\n\
+                                      jsonrpc -> JSON-RPC interface\n"
                                       ^other^ " is not a legal value")))
     (function Uicommon.Text -> ["text"]
-      | Uicommon.Graphic -> ["graphic"])
+      | Uicommon.Graphic -> ["graphic"]
+      | Uicommon.Jsonrpc -> ["jsonrpc"])
     Uicommon.minterface
 
 let catch_all f =
@@ -283,6 +287,7 @@ let nonGuiStartup () = begin
   (try
     (match Util.StringMap.find uiPrefName argv with
       "text"::_    -> (Uitext.Body.start Uicommon.Text; exit 0)
+    | "jsonrpc"::_ -> (Uijsonrpc.Body.start Uicommon.Jsonrpc; exit 0)
     | "graphic"::_ -> () (* fallthru *)
     | _            -> Prefs.printUsage Uicommon.usageMsg; exit 1)
   with Not_found -> ());
@@ -292,6 +297,11 @@ end
 module Body = functor (Ui : Uicommon.UI) -> struct
   let argv = init() in (* might not return *)
   (* if it returns start a UI *)
+  (try
+    match Util.StringMap.find uiPrefName argv with
+    | "jsonrpc"::_ -> Uijsonrpc.Body.start Uicommon.Jsonrpc; exit 0
+    | _ -> ()
+  with Not_found -> ());
   Ui.start
     (try
       (match Util.StringMap.find uiPrefName argv with

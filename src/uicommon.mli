@@ -5,6 +5,7 @@
 type interface =
    Text
  | Graphic
+ | Jsonrpc
 
 val minterface : interface Umarshal.t
 
