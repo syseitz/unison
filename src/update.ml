@@ -1981,6 +1981,16 @@ let archivesExistOnRoot: Common.root -> unit -> (bool * bool) Lwt.t =
            let (oldname, _) = archiveName251 fspath MainArch in
            System.file_exists (Util.fileInUnisonDir oldname)
        in
+       (* In lowmemory mode, also check for a valid SQLite archive DB.
+          The DB may be the only archive source if the traditional ar* file
+          was not yet written (interrupted commit) or was deleted. *)
+       let oldexists =
+         if oldexists then oldexists
+         else if Prefs.read lowmemory then
+           let (sqliteName, _) = sqliteArchiveName fspath in
+           Archive_db.is_valid (Util.fileInUnisonDir sqliteName)
+         else oldexists
+       in
        Lwt.return (oldexists, newexists))
 
 let forall = Safelist.for_all (fun x -> x)
