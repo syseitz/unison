@@ -4462,7 +4462,13 @@ let collectPathsFromArchiveDb () =
          Root "" gets depth -1 so it is processed after its depth-0 children. *)
       let depth s =
         if s = "" then -1
-        else String.fold_left (fun n c -> if c = '/' then n + 1 else n) 0 s in
+        else begin
+          let n = ref 0 in
+          for i = 0 to String.length s - 1 do
+            if s.[i] = '/' then incr n
+          done;
+          !n
+        end in
       let by_depth = SMap.bindings !weight_of
         |> List.sort (fun (a, _) (b, _) -> compare (depth b) (depth a)) in
       let subtree_w = ref SMap.empty in
