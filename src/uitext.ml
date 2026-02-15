@@ -1581,19 +1581,27 @@ let list_chunks_by_weight maxWeight items =
    are detected correctly within each batch. *)
 let synchronizeOnceLowmemoryBatched () =
   Uicommon.connectRoots ~displayWaitMessage ();
-  (* Try fast DB-based path collection first, fall back to RPCs *)
+  (* Try fast DB-based path collection first, fall back to local filesystem walk *)
+  alwaysDisplay "\nLowmemory: collecting paths for batch planning\n";
   let allPathsWeighted =
     let dbPaths = Update.collectPathsFromArchiveDb () in
-    if dbPaths <> [] then begin
-      Trace.log "Lowmemory: using archive DB for batch planning\n";
+    if List.length dbPaths >= 10 then begin
+      alwaysDisplay (Printf.sprintf
+        "Lowmemory: using archive DB (%d paths)\n" (List.length dbPaths));
       dbPaths
-    end else
-      collectBatchPaths ()
+    end else begin
+      alwaysDisplay "Lowmemory: scanning local filesystem for batch planning\n";
+      let result = Update.collectDirStructureLocal () in
+      alwaysDisplay (Printf.sprintf
+        "Lowmemory: filesystem scan found %d batch paths\n" (List.length result));
+      result
+    end
   in
-  if allPathsWeighted = [] then
+  if allPathsWeighted = [] then begin
+    alwaysDisplay "Lowmemory: no paths found, falling back to full sync\n";
     synchronizeOnce None
-  else begin
-    let maxFilesPerBatch = 10000 in
+  end else begin
+    let maxFilesPerBatch = 100000 in
     let batches = list_chunks_by_weight maxFilesPerBatch allPathsWeighted in
     let savedPaths = Prefs.read Globals.paths in
     let exitStatus = ref Uicommon.perfectExit in

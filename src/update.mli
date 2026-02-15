@@ -114,6 +114,11 @@ val checkArchivesExist : unit -> bool
    RPC-based directory tree exploration. Returns [] if no archive DB. *)
 val collectPathsFromArchiveDb : unit -> (Path.t * int) list
 
+(* Walk local filesystem to collect directory structure for batch planning.
+   Only reads directory names (no file metadata). Fast fallback when
+   no SQLite archive DB exists yet. *)
+val collectDirStructureLocal : unit -> (Path.t * int) list
+
 (* Clear in-memory caches between lowmemory batches to free memory.
    Replaces archives with skeletons and clears auxiliary caches. *)
 val clearBatchState : unit -> unit

@@ -928,7 +928,10 @@ let clearBatchState () =
   (* Clear all auxiliary caches *)
   dir_cache_clear ();
   Hashtbl.clear archivePropCache;
-  Hashtbl.clear archiveInfoCache;
+  (* Keep archiveInfoCache: it was correctly updated by postCommitArchiveLocal
+     and is needed so that loadArchives' optimistic path recognizes the archive
+     as unchanged in the next batch, avoiding the "lowmemory -> normal switch"
+     code path which would load the full archive into memory and delete SQLite *)
   Hashtbl.clear db_modified;
   scan_db := None;
   scan_root := "";
@@ -4422,12 +4425,67 @@ let checkArchivesExist () =
     List.for_all Fun.id result
   with _ -> true
 
+(* Given a map of path -> direct_weight, compute subtree weights and
+   split the tree into non-overlapping batch items where each item's
+   subtree weight does not exceed maxWeight. Returns sorted (Path.t * int) list. *)
+let splitIntoBatches ?(maxWeight=10000) weight_of =
+  let module SMap = Map.Make(String) in
+  (* Build parent -> children map *)
+  let children_of = ref SMap.empty in
+  SMap.iter (fun p _ ->
+    if p <> "" then begin
+      let parent = match String.rindex_opt p '/' with
+        | Some i -> String.sub p 0 i
+        | None -> ""
+      in
+      let existing =
+        try SMap.find parent !children_of
+        with Not_found -> [] in
+      children_of := SMap.add parent (p :: existing) !children_of
+    end
+  ) weight_of;
+  (* Compute subtree weights bottom-up: process deepest paths first.
+     Root "" gets depth -1 so it is processed after its depth-0 children. *)
+  let depth s =
+    if s = "" then -1
+    else begin
+      let n = ref 0 in
+      for i = 0 to String.length s - 1 do
+        if s.[i] = '/' then incr n
+      done;
+      !n
+    end in
+  let by_depth = SMap.bindings weight_of
+    |> List.sort (fun (a, _) (b, _) -> compare (depth b) (depth a)) in
+  let subtree_w = ref SMap.empty in
+  List.iter (fun (p, w) ->
+    let child_sum = match SMap.find_opt p !children_of with
+      | None -> 0
+      | Some kids -> List.fold_left (fun acc k ->
+          acc + (try SMap.find k !subtree_w with Not_found -> 0)
+        ) 0 kids
+    in
+    subtree_w := SMap.add p (w + child_sum) !subtree_w
+  ) by_depth;
+  (* Walk top-down: split large subtrees, emit small ones as batch items *)
+  let result = ref [] in
+  let rec walk p =
+    let sw = try SMap.find p !subtree_w with Not_found -> 1 in
+    if sw <= maxWeight then
+      result := (Path.fromString p, sw) :: !result
+    else
+      match SMap.find_opt p !children_of with
+      | None ->
+          result := (Path.fromString p, sw) :: !result
+      | Some kids -> List.iter walk kids
+  in
+  walk "";
+  List.sort (fun (a, _) (b, _) -> Path.compare a b) !result
+
 (* Read directory structure from the local SQLite archive database and
    return non-overlapping paths with subtree weights for batch planning.
-   Computes subtree weights (sum of all descendant weights) and walks
-   the tree top-down, splitting directories that exceed maxWeight into
-   their children. This ensures each batch item represents a manageable
-   amount of work. Returns [] if no local SQLite archive exists. *)
+   Uses LENGTH(data) as a proxy for child count (~150 bytes per entry).
+   Returns [] if no local SQLite archive exists. *)
 let collectPathsFromArchiveDb () =
   try
     let localRoot = Globals.localRoot () in
@@ -4438,64 +4496,55 @@ let collectPathsFromArchiveDb () =
     else begin
       let db = Archive_db.open_db sqlitePath in
       let module SMap = Map.Make(String) in
-      (* Read all paths with estimated direct child counts *)
       let weight_of = ref SMap.empty in
       Archive_db.iter_path_sizes db (fun path size ->
         weight_of := SMap.add path (max 1 (size / 150)) !weight_of
       );
       Archive_db.close_db db;
-      (* Build parent -> children map *)
-      let children_of = ref SMap.empty in
-      SMap.iter (fun p _ ->
-        if p <> "" then begin
-          let parent = match String.rindex_opt p '/' with
-            | Some i -> String.sub p 0 i
-            | None -> ""
-          in
-          let existing =
-            try SMap.find parent !children_of
-            with Not_found -> [] in
-          children_of := SMap.add parent (p :: existing) !children_of
-        end
-      ) !weight_of;
-      (* Compute subtree weights bottom-up: process deepest paths first.
-         Root "" gets depth -1 so it is processed after its depth-0 children. *)
-      let depth s =
-        if s = "" then -1
-        else begin
-          let n = ref 0 in
-          for i = 0 to String.length s - 1 do
-            if s.[i] = '/' then incr n
-          done;
-          !n
-        end in
-      let by_depth = SMap.bindings !weight_of
-        |> List.sort (fun (a, _) (b, _) -> compare (depth b) (depth a)) in
-      let subtree_w = ref SMap.empty in
-      List.iter (fun (p, w) ->
-        let child_sum = match SMap.find_opt p !children_of with
-          | None -> 0
-          | Some kids -> List.fold_left (fun acc k ->
-              acc + (try SMap.find k !subtree_w with Not_found -> 0)
-            ) 0 kids
-        in
-        subtree_w := SMap.add p (w + child_sum) !subtree_w
-      ) by_depth;
-      (* Walk top-down: split large subtrees, emit small ones as batch items *)
-      let maxWeight = 10000 in
-      let result = ref [] in
-      let rec walk p =
-        let sw = try SMap.find p !subtree_w with Not_found -> 1 in
-        if sw <= maxWeight then
-          result := (Path.fromString p, sw) :: !result
-        else
-          match SMap.find_opt p !children_of with
-          | None ->
-              (* Leaf but still heavy - emit as single batch item *)
-              result := (Path.fromString p, sw) :: !result
-          | Some kids -> List.iter walk kids
-      in
-      walk "";
-      List.sort (fun (a, _) (b, _) -> Path.compare a b) !result
+      splitIntoBatches ~maxWeight:100000 !weight_of
     end
   with _ -> []
+
+(* C stub: reads directory entries using d_type (Unix) or FindFirstFile
+   (Windows) to separate subdirectories from files without stat() calls.
+   Returns (subdirectory_names: string list, file_count: int). *)
+external readdir_types : string -> string list * int = "caml_readdir_types"
+
+(* Walk the local filesystem to collect directory structure for batch
+   planning. Uses readdir_types for fast directory/file separation
+   without stat() syscalls. Used as fallback when the SQLite archive
+   DB is empty or does not exist yet. *)
+let collectDirStructureLocal () =
+  try
+    let (_, fspath) = Globals.localRoot () in
+    let root = Fspath.toString fspath in
+    Trace.log (Printf.sprintf
+      "collectDirStructureLocal: scanning root=%s\n" root);
+    let module SMap = Map.Make(String) in
+    let weight_of = ref SMap.empty in
+    let nDirs = ref 0 in
+    let rec walk pathStr =
+      let fullPath =
+        if pathStr = "" then root
+        else Filename.concat root pathStr in
+      let (subdirs, nFiles) = readdir_types fullPath in
+      weight_of := SMap.add pathStr (max 1 nFiles) !weight_of;
+      incr nDirs;
+      List.iter (fun name ->
+        let childPath =
+          if pathStr = "" then name
+          else pathStr ^ "/" ^ name in
+        if not (Globals.shouldIgnore (Path.fromString childPath)) then
+          walk childPath
+      ) subdirs
+    in
+    walk "";
+    let result = splitIntoBatches ~maxWeight:100000 !weight_of in
+    Trace.log (Printf.sprintf
+      "collectDirStructureLocal: found %d directories, split into %d batches\n"
+      !nDirs (List.length result));
+    result
+  with e ->
+    Trace.log (Printf.sprintf
+      "collectDirStructureLocal: exception %s\n" (Printexc.to_string e));
+    []
