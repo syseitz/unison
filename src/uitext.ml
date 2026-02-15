@@ -1519,12 +1519,12 @@ let collectBatchPaths () =
          not (Globals.shouldIgnore (Path.child path name)))
   in
   let rec expand depth names =
-    if depth >= maxDepth then [names]
+    if depth >= maxDepth then [(names, 1)]
     else
       let info = expandInfoAt names in
       let nChildren = List.length info in
-      if nChildren = 0 then [names]
-      else if nChildren > maxExpand then [names]
+      if nChildren = 0 then [(names, 1)]
+      else if nChildren > maxExpand then [(names, nChildren)]
       else
         let gcTotal = List.fold_left (fun acc (_, n) -> acc + n) 0 info in
         if nChildren > expandThreshold || gcTotal > expandThreshold then begin
@@ -1534,12 +1534,12 @@ let collectBatchPaths () =
             nChildren gcTotal depth);
           List.flatten (List.map (fun (name, nGc) ->
             if nGc = 0 || nGc > maxExpand then
-              [names @ [name]]
+              [(names @ [name], max 1 nGc)]
             else
               expand (depth + 1) (names @ [name])
           ) info)
         end else
-          [names]
+          [(names, nChildren)]
   in
   let topInfo = expandInfoAt [] in
   if topInfo = [] then []
@@ -1547,33 +1547,40 @@ let collectBatchPaths () =
     let namesList = List.flatten (List.map (fun (n, _) ->
       expand 1 [n]
     ) topInfo) in
-    List.map (fun names ->
-      List.fold_left Path.child Path.empty names
+    List.map (fun (names, weight) ->
+      (List.fold_left Path.child Path.empty names, weight)
     ) namesList
 
-(* Split a list into chunks of at most n elements *)
-let rec list_chunks n = function
-  | [] -> []
-  | l ->
-      let rec take acc k = function
-        | [] -> (List.rev acc, [])
-        | remaining when k = 0 -> (List.rev acc, remaining)
-        | x :: rest -> take (x :: acc) (k - 1) rest
-      in
-      let (chunk, rest) = take [] n l in
-      chunk :: list_chunks n rest
+(* Split a list of (item, weight) pairs into chunks where the total
+   weight per chunk does not exceed maxWeight. Each item appears in
+   exactly one chunk. Items heavier than maxWeight get their own chunk. *)
+let list_chunks_by_weight maxWeight items =
+  let rec go acc cur curW = function
+    | [] ->
+        let all = if cur = [] then acc else List.rev cur :: acc in
+        List.rev all
+    | (item, w) :: rest ->
+        if cur = [] then
+          go acc [item] w rest
+        else if curW + w > maxWeight then
+          go (List.rev cur :: acc) [item] w rest
+        else
+          go acc (item :: cur) (curW + w) rest
+  in
+  go [] [] 0 items
 
 (* Batched initial sync for lowmemory mode: collect paths (with large
-   directories expanded), split into batches, and run the full sync
-   pipeline for each batch separately, freeing memory between batches. *)
+   directories expanded), split into batches by estimated file count,
+   and run the full sync pipeline for each batch separately, freeing
+   memory between batches. *)
 let synchronizeOnceLowmemoryBatched () =
   Uicommon.connectRoots ~displayWaitMessage ();
-  let allPaths = collectBatchPaths () in
-  if allPaths = [] then
+  let allPathsWeighted = collectBatchPaths () in
+  if allPathsWeighted = [] then
     synchronizeOnce None
   else begin
-    let batchSize = 1 in
-    let batches = list_chunks batchSize allPaths in
+    let maxFilesPerBatch = 10000 in
+    let batches = list_chunks_by_weight maxFilesPerBatch allPathsWeighted in
     let savedPaths = Prefs.read Globals.paths in
     let exitStatus = ref Uicommon.perfectExit in
     let allFailedPaths = ref [] in
