@@ -28,4 +28,6 @@ let load_meta _ _ = no_sqlite3 ()
 
 let iter_all _ _ = no_sqlite3 ()
 
+let iter_path_sizes _ _ = no_sqlite3 ()
+
 let is_valid _ = false

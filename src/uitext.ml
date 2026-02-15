@@ -1572,10 +1572,24 @@ let list_chunks_by_weight maxWeight items =
 (* Batched sync for lowmemory mode: collect paths (with large
    directories expanded), split into batches by estimated file count,
    and run the full sync pipeline for each batch separately, freeing
-   memory between batches. Works for both initial and follow-up syncs. *)
+   memory between batches. Works for both initial and follow-up syncs.
+
+   For follow-up syncs (archives exist), reads the directory structure
+   from the local SQLite archive DB instead of doing expensive RPCs.
+   The DB-based plan is approximate; the actual scan still compares
+   the filesystem against the archive, so new/deleted directories
+   are detected correctly within each batch. *)
 let synchronizeOnceLowmemoryBatched () =
   Uicommon.connectRoots ~displayWaitMessage ();
-  let allPathsWeighted = collectBatchPaths () in
+  (* Try fast DB-based path collection first, fall back to RPCs *)
+  let allPathsWeighted =
+    let dbPaths = Update.collectPathsFromArchiveDb () in
+    if dbPaths <> [] then begin
+      Trace.log "Lowmemory: using archive DB for batch planning\n";
+      dbPaths
+    end else
+      collectBatchPaths ()
+  in
   if allPathsWeighted = [] then
     synchronizeOnce None
   else begin

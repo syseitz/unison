@@ -4421,3 +4421,54 @@ let checkArchivesExist () =
     ) in
     List.for_all Fun.id result
   with _ -> true
+
+(* Read directory paths and estimated child counts from the local
+   SQLite archive database. Returns only leaf directories (directories
+   that have no subdirectories in the DB) as batch items, plus
+   intermediate directories whose children are not all in the DB.
+   Uses LENGTH(data) as a proxy for child count (~150 bytes per child
+   entry) to avoid deserialization overhead.
+   Returns [] if no local SQLite archive exists. *)
+let collectPathsFromArchiveDb () =
+  try
+    let localRoot = Globals.localRoot () in
+    let (_, fspath) = localRoot in
+    let (sqliteName, _) = sqliteArchiveName fspath in
+    let sqlitePath = Util.fileInUnisonDir sqliteName in
+    if not (Archive_db.is_valid sqlitePath) then []
+    else begin
+      let db = Archive_db.open_db sqlitePath in
+      (* Collect all paths with their estimated child counts *)
+      let module SSet = Set.Make(String) in
+      let all_paths = ref [] in
+      let path_set = ref SSet.empty in
+      Archive_db.iter_path_sizes db (fun path size ->
+        let estimated_children = max 1 (size / 150) in
+        all_paths := (path, estimated_children) :: !all_paths;
+        path_set := SSet.add path !path_set
+      );
+      Archive_db.close_db db;
+      (* Build set of all parent paths. For each "a/b/c", add "a/b", "a", "".
+         Then leaves = paths NOT in the parent set. *)
+      let parents = ref SSet.empty in
+      SSet.iter (fun p ->
+        let rec add_parents s =
+          match String.rindex_opt s '/' with
+          | Some i ->
+              let parent = String.sub s 0 i in
+              parents := SSet.add parent !parents;
+              add_parents parent
+          | None ->
+              if s <> "" then parents := SSet.add "" !parents
+        in
+        add_parents p
+      ) !path_set;
+      let leaves = List.filter (fun (p, _) ->
+        not (SSet.mem p !parents)
+      ) !all_paths in
+      let result = List.map (fun (p, w) ->
+        (Path.fromString p, w)
+      ) leaves in
+      List.sort (fun (a, _) (b, _) -> Path.compare a b) result
+    end
+  with _ -> []

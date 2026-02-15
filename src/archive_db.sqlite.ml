@@ -190,6 +190,24 @@ let iter_all t f =
   done;
   ignore (Sqlite3.finalize stmt)
 
+(* Iterate over all directory paths with blob sizes, without loading data *)
+let iter_path_sizes t f =
+  let stmt = Sqlite3.prepare t.db "SELECT path, LENGTH(data) FROM dirs" in
+  let continue = ref true in
+  while !continue do
+    match Sqlite3.step stmt with
+    | Sqlite3.Rc.ROW ->
+        let path = match Sqlite3.column stmt 0 with
+          | Sqlite3.Data.TEXT s -> s
+          | _ -> "" in
+        let size = match Sqlite3.column stmt 1 with
+          | Sqlite3.Data.INT i -> Int64.to_int i
+          | _ -> 0 in
+        f path size
+    | _ -> continue := false
+  done;
+  ignore (Sqlite3.finalize stmt)
+
 let is_valid path =
   try
     if not (Sys.file_exists path) then false

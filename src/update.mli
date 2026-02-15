@@ -109,6 +109,11 @@ val lowmemory : bool Prefs.t
    Must be called AFTER connectRoots/storeRootsName. *)
 val checkArchivesExist : unit -> bool
 
+(* Read directory paths and estimated child counts from the local
+   SQLite archive database. Fast and memory-efficient alternative to
+   RPC-based directory tree exploration. Returns [] if no archive DB. *)
+val collectPathsFromArchiveDb : unit -> (Path.t * int) list
+
 (* Clear in-memory caches between lowmemory batches to free memory.
    Replaces archives with skeletons and clears auxiliary caches. *)
 val clearBatchState : unit -> unit

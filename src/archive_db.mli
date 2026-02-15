@@ -34,5 +34,10 @@ val load_meta : t -> string -> string option
    Does not build an intermediate list. *)
 val iter_all : t -> (string -> string -> unit) -> unit
 
+(* Iterate over all directory paths with blob sizes, without loading data.
+   Calls [f path data_length] for each entry. Useful for estimating
+   child counts without deserialization overhead. *)
+val iter_path_sizes : t -> (string -> int -> unit) -> unit
+
 (* Check if a valid database exists at the given path *)
 val is_valid : string -> bool
