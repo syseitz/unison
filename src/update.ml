@@ -4422,13 +4422,12 @@ let checkArchivesExist () =
     List.for_all Fun.id result
   with _ -> true
 
-(* Read directory paths and estimated child counts from the local
-   SQLite archive database. Returns only leaf directories (directories
-   that have no subdirectories in the DB) as batch items, plus
-   intermediate directories whose children are not all in the DB.
-   Uses LENGTH(data) as a proxy for child count (~150 bytes per child
-   entry) to avoid deserialization overhead.
-   Returns [] if no local SQLite archive exists. *)
+(* Read directory structure from the local SQLite archive database and
+   return non-overlapping paths with subtree weights for batch planning.
+   Computes subtree weights (sum of all descendant weights) and walks
+   the tree top-down, splitting directories that exceed maxWeight into
+   their children. This ensures each batch item represents a manageable
+   amount of work. Returns [] if no local SQLite archive exists. *)
 let collectPathsFromArchiveDb () =
   try
     let localRoot = Globals.localRoot () in
@@ -4438,37 +4437,57 @@ let collectPathsFromArchiveDb () =
     if not (Archive_db.is_valid sqlitePath) then []
     else begin
       let db = Archive_db.open_db sqlitePath in
-      (* Collect all paths with their estimated child counts *)
-      let module SSet = Set.Make(String) in
-      let all_paths = ref [] in
-      let path_set = ref SSet.empty in
+      let module SMap = Map.Make(String) in
+      (* Read all paths with estimated direct child counts *)
+      let weight_of = ref SMap.empty in
       Archive_db.iter_path_sizes db (fun path size ->
-        let estimated_children = max 1 (size / 150) in
-        all_paths := (path, estimated_children) :: !all_paths;
-        path_set := SSet.add path !path_set
+        weight_of := SMap.add path (max 1 (size / 150)) !weight_of
       );
       Archive_db.close_db db;
-      (* Build set of all parent paths. For each "a/b/c", add "a/b", "a", "".
-         Then leaves = paths NOT in the parent set. *)
-      let parents = ref SSet.empty in
-      SSet.iter (fun p ->
-        let rec add_parents s =
-          match String.rindex_opt s '/' with
-          | Some i ->
-              let parent = String.sub s 0 i in
-              parents := SSet.add parent !parents;
-              add_parents parent
-          | None ->
-              if s <> "" then parents := SSet.add "" !parents
+      (* Build parent -> children map *)
+      let children_of = ref SMap.empty in
+      SMap.iter (fun p _ ->
+        if p <> "" then begin
+          let parent = match String.rindex_opt p '/' with
+            | Some i -> String.sub p 0 i
+            | None -> ""
+          in
+          let existing =
+            try SMap.find parent !children_of
+            with Not_found -> [] in
+          children_of := SMap.add parent (p :: existing) !children_of
+        end
+      ) !weight_of;
+      (* Compute subtree weights bottom-up: process deepest paths first *)
+      let depth s =
+        String.fold_left (fun n c -> if c = '/' then n + 1 else n) 0 s in
+      let by_depth = SMap.bindings !weight_of
+        |> List.sort (fun (a, _) (b, _) -> compare (depth b) (depth a)) in
+      let subtree_w = ref SMap.empty in
+      List.iter (fun (p, w) ->
+        let child_sum = match SMap.find_opt p !children_of with
+          | None -> 0
+          | Some kids -> List.fold_left (fun acc k ->
+              acc + (try SMap.find k !subtree_w with Not_found -> 0)
+            ) 0 kids
         in
-        add_parents p
-      ) !path_set;
-      let leaves = List.filter (fun (p, _) ->
-        not (SSet.mem p !parents)
-      ) !all_paths in
-      let result = List.map (fun (p, w) ->
-        (Path.fromString p, w)
-      ) leaves in
-      List.sort (fun (a, _) (b, _) -> Path.compare a b) result
+        subtree_w := SMap.add p (w + child_sum) !subtree_w
+      ) by_depth;
+      (* Walk top-down: split large subtrees, emit small ones as batch items *)
+      let maxWeight = 10000 in
+      let result = ref [] in
+      let rec walk p =
+        let sw = try SMap.find p !subtree_w with Not_found -> 1 in
+        if sw <= maxWeight then
+          result := (Path.fromString p, sw) :: !result
+        else
+          match SMap.find_opt p !children_of with
+          | None ->
+              (* Leaf but still heavy - emit as single batch item *)
+              result := (Path.fromString p, sw) :: !result
+          | Some kids -> List.iter walk kids
+      in
+      walk "";
+      List.sort (fun (a, _) (b, _) -> Path.compare a b) !result
     end
   with _ -> []
