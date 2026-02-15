@@ -4458,9 +4458,11 @@ let collectPathsFromArchiveDb () =
           children_of := SMap.add parent (p :: existing) !children_of
         end
       ) !weight_of;
-      (* Compute subtree weights bottom-up: process deepest paths first *)
+      (* Compute subtree weights bottom-up: process deepest paths first.
+         Root "" gets depth -1 so it is processed after its depth-0 children. *)
       let depth s =
-        String.fold_left (fun n c -> if c = '/' then n + 1 else n) 0 s in
+        if s = "" then -1
+        else String.fold_left (fun n c -> if c = '/' then n + 1 else n) 0 s in
       let by_depth = SMap.bindings !weight_of
         |> List.sort (fun (a, _) (b, _) -> compare (depth b) (depth a)) in
       let subtree_w = ref SMap.empty in
